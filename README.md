@@ -59,11 +59,49 @@
   python -m src.cli --help  # list commands
   ```
 
+- **Run in background**
+
+  To run the webhook server in the background (e.g. so Pub/Sub can reach it without keeping a terminal open):
+
+  ```bash
+  python -m src.cli start --background   # or: start -d
+  ```
+
+  The PID is written to `~/.doot/doot.pid` (or `DOOT_PID_PATH`). Logs go to `~/.doot/doot.log` (or `DOOT_LOG_PATH`). To stop:
+
+  ```bash
+  python -m src.cli stop
+  ```
+
+  Expose port 8000 (e.g. `ngrok http 8000` or Tailscale Funnel) and point your Pub/Sub push subscription at your public URL. When a new email triggers the webhook, the `on_gmail_push` hook in `src/webhook.py` runs (no-op by default; you can implement Telegram or other actions there).
+
+- **Gmail Pub/Sub (verify push is working)**
+
+  1. In Google Cloud: create a Pub/Sub topic, grant `gmail-api-push@system.gserviceaccount.com` publish on it, create a **push** subscription with endpoint `https://your-tunnel/webhook/gmail` (e.g. ngrok or Tailscale Funnel). Set `PUBSUB_TOPIC` and `WEBHOOK_URL` in `.env`.
+  2. Start the webhook server and expose it (e.g. `ngrok http 8000` pointing at your machine):
+
+     ```bash
+     python -m src.cli webhook
+     ```
+
+  3. Register Gmail to push to your topic:
+
+     ```bash
+     python -m src.cli watch-gmail
+     ```
+
+  4. Send yourself a test email; you should see a POST to `/webhook/gmail` and a log line with `emailAddress` and `historyId`.
+
+## Docs
+
+- **[docs/setup-gmail-pubsub.md](docs/setup-gmail-pubsub.md)** — Step-by-step: auth, webhook, ngrok, Pub/Sub topic & push subscription, `watch-gmail`, and how to verify new-email webhooks are working.
+
 ## Project layout
 
 ```
 src/
-  cli.py              # Entrypoint: auth, chat, version
+  cli.py              # Entrypoint: auth, chat, start (--background), stop, webhook, watch-gmail, version
+  webhook.py          # FastAPI server: POST /webhook/gmail; on_gmail_push(payload) hook for proactive actions
   graph/
     orchestrator.py   # Router + graph (router → gmail | direct → END)
   agents/

@@ -13,6 +13,19 @@ def get_gmail_service():
     return build("gmail", "v1", credentials=creds)
 
 
+def watch(topic_name: str, user_id: str = "me", label_ids: list[str] | None = None):
+    """
+    Register Gmail push notifications to a Pub/Sub topic.
+    Returns dict with historyId and expiration (epoch ms). Renew before expiration (e.g. daily).
+    """
+    service = get_gmail_service()
+    body = {"topicName": topic_name}
+    if label_ids is not None:
+        body["labelIds"] = label_ids
+        body["labelFilterBehavior"] = "INCLUDE"
+    return service.users().watch(userId=user_id, body=body).execute()
+
+
 def list_messages(
     *,
     user_id: str = "me",
