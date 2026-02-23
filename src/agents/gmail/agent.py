@@ -25,9 +25,10 @@ SYSTEM_PROMPT = SystemMessage(
 
 def create_gmail_agent():
     """Create a ReAct agent with Gmail tools."""
+    raw = (os.getenv("ANTHROPIC_API_KEY") or "").strip() or None
     llm = ChatAnthropic(
         model="claude-sonnet-4-20250514",
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        anthropic_api_key=raw,
         max_tokens=4096,
     )
     return create_react_agent(

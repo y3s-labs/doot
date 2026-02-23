@@ -14,6 +14,13 @@ from src.agents.gmail.agent import create_gmail_agent
 
 log = logging.getLogger("doot.orchestrator")
 
+
+def _anthropic_api_key() -> str | None:
+    """ANTHROPIC_API_KEY from env, stripped so .env newlines/spaces don't break auth."""
+    raw = os.getenv("ANTHROPIC_API_KEY")
+    return (raw.strip() if raw else None) or None
+
+
 ROUTER_SYSTEM = SystemMessage(
     content=(
         "You are a routing assistant. Given the user's message, decide which agent should handle it.\n"
@@ -33,7 +40,7 @@ class OrchestratorState(TypedDict):
 def _build_router_llm():
     return ChatAnthropic(
         model="claude-sonnet-4-20250514",
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        anthropic_api_key=_anthropic_api_key(),
         max_tokens=50,
     )
 
@@ -71,7 +78,7 @@ def direct_node(state: OrchestratorState) -> OrchestratorState:
     log.info("Direct node: answering without agent...")
     llm = ChatAnthropic(
         model="claude-sonnet-4-20250514",
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY"),
+        anthropic_api_key=_anthropic_api_key(),
         max_tokens=4096,
     )
     response = llm.invoke(state["messages"])

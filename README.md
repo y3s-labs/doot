@@ -8,6 +8,7 @@
 - **Gmail agent** — Lists inbox, searches mail, and fetches full messages via the Gmail API.
 - **Orchestrator** — Routes your message to the right agent (e.g. “show my last 5 emails” → Gmail agent).
 - **Chat CLI** — One-shot or interactive: ask in plain language and get answers.
+- **Telegram bot** — Chat with the same orchestrator from Telegram; shares the global session with the CLI.
 
 ## Setup
 
@@ -25,7 +26,7 @@
    - `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` — from [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials → OAuth 2.0 Client (e.g. Desktop app), and add `http://localhost:8080` as a redirect URI.
    - `ANTHROPIC_API_KEY` — for the orchestrator and Gmail agent.
 
-   Optional: `DOOT_TOKENS_PATH`, `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`.
+   Optional: `DOOT_TOKENS_PATH`, `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`. For Telegram: `TELEGRAM_BOT_TOKEN` (required for the bot), `TELEGRAM_WEBHOOK_BASE_URL` (e.g. `https://yourdomain.com`) to auto-register the webhook when the server starts.
 
 3. **Authenticate**
 
@@ -92,8 +93,11 @@
 
   4. Send yourself a test email; you should see a POST to `/webhook/gmail` and a log line with `emailAddress` and `historyId`.
 
-## Docs
+- **Telegram**
 
+  Set `TELEGRAM_BOT_TOKEN` in `.env` (from [@BotFather](https://t.me/BotFather)). With the webhook server running and reachable at a public HTTPS URL, set `TELEGRAM_WEBHOOK_BASE_URL` to that base URL (e.g. `https://your-ngrok-host.ngrok.io`); on startup the server will register `POST /webhook/telegram` as the bot’s webhook. You can then chat with your bot in Telegram; it uses the same global session as the CLI. See **[docs/telegram-setup.md](docs/telegram-setup.md)** for the full walkthrough.
+
+- **[docs/telegram-setup.md](docs/telegram-setup.md)** — Step-by-step: create a Telegram bot, set `TELEGRAM_BOT_TOKEN`, webhook vs polling, and chat with Doot from Telegram (shared global session with CLI).
 - **[docs/setup-gmail-pubsub.md](docs/setup-gmail-pubsub.md)** — Step-by-step: auth, webhook, ngrok, Pub/Sub topic & push subscription, `watch-gmail`, and how to verify new-email webhooks are working.
 
 ## Project layout
@@ -101,7 +105,9 @@
 ```
 src/
   cli.py              # Entrypoint: auth, chat, start (--background), stop, webhook, watch-gmail, version
-  webhook.py          # FastAPI server: POST /webhook/gmail; on_gmail_push(payload) hook for proactive actions
+  webhook.py          # FastAPI: POST /webhook/gmail, POST /webhook/telegram; Gmail push + Telegram bot
+  session.py          # Global chat session load/save (CLI + Telegram)
+  orchestrator_runner.py  # invoke_orchestrator(messages) → (result, last_ai_text)
   graph/
     orchestrator.py   # Router + graph (router → gmail | direct → END)
   agents/

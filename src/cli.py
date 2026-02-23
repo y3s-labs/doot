@@ -12,7 +12,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+# Load .env from project root so it works regardless of cwd (e.g. python -m src.cli)
+_load_env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_load_env_path)
 
 import typer
 from rich.console import Console
@@ -20,6 +22,7 @@ from rich.logging import RichHandler
 from rich.markdown import Markdown
 
 from src.agents.gmail.auth import get_credentials
+from src.session import load_session, save_session
 
 logging.basicConfig(
     level=logging.INFO,
@@ -62,62 +65,6 @@ def _log_path() -> Path:
     if path:
         return Path(path).expanduser()
     return _pid_path().parent / "doot.log"
-
-
-def _session_path() -> Path:
-    """Path for persisted chat session (JSON)."""
-    base = os.getenv("DOOT_TOKENS_PATH", "~/.doot/tokens.json")
-    return Path(base).expanduser().parent / "chat_session.json"
-
-
-def _load_session():
-    """Load session messages from file. Returns list of HumanMessage/AIMessage; empty list if missing or invalid."""
-    from langchain_core.messages import AIMessage, HumanMessage
-
-    path = _session_path()
-    if not path.exists():
-        return []
-    try:
-        raw = path.read_text()
-        data = json.loads(raw) if raw.strip() else []
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning("Could not load session from %s: %s", path, e)
-        return []
-    out = []
-    for item in data:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role")
-        content = item.get("content")
-        if content is None:
-            content = ""
-        if role == "human":
-            out.append(HumanMessage(content=content))
-        elif role == "ai":
-            out.append(AIMessage(content=content))
-    return out
-
-
-def _save_session(messages) -> None:
-    """Persist message list to session file (JSON array of {role, content})."""
-    from langchain_core.messages import AIMessage, HumanMessage
-
-    path = _session_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
-    for msg in messages:
-        if isinstance(msg, HumanMessage):
-            rows.append({"role": "human", "content": msg.content if isinstance(msg.content, str) else str(msg.content)})
-        elif isinstance(msg, AIMessage):
-            content = msg.content
-            if isinstance(content, list):
-                content = "\n".join(
-                    block.get("text", str(block)) if isinstance(block, dict) else str(block) for block in content
-                )
-            else:
-                content = content if isinstance(content, str) else str(content)
-            rows.append({"role": "ai", "content": content})
-    path.write_text(json.dumps(rows, indent=2))
 
 
 @app.command()
@@ -201,13 +148,47 @@ def auth() -> None:
     typer.echo("Credentials saved.")
 
 
+@app.command()
+def check_env() -> None:
+    """Verify ANTHROPIC_API_KEY by making one minimal API call. Use this to confirm the key is valid."""
+    key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if not key:
+        typer.echo("ANTHROPIC_API_KEY is not set or empty. Add it to .env and try again.", err=True)
+        raise typer.Exit(1)
+    try:
+        from anthropic import Anthropic
+        from anthropic import AuthenticationError
+    except ImportError:
+        typer.echo("anthropic package not installed.", err=True)
+        raise typer.Exit(1)
+    try:
+        client = Anthropic(api_key=key)
+        client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        typer.echo("ANTHROPIC_API_KEY is valid.")
+    except AuthenticationError as e:
+        typer.echo(
+            "ANTHROPIC_API_KEY was rejected (401). Create a new key at https://console.anthropic.com/ "
+            "and set it in .env.",
+            err=True,
+        )
+        typer.echo(str(e), err=True)
+        raise typer.Exit(1)
+    except Exception as e:
+        typer.echo(f"Unexpected error: {e}", err=True)
+        raise typer.Exit(1)
+
+
 def _run_chat_interactive() -> None:
     """Load session, run interactive chat loop (read input, invoke, save, print)."""
     from langchain_core.messages import HumanMessage
 
     from src.graph.orchestrator import build_orchestrator
 
-    messages = _load_session()
+    messages = load_session()
     orchestrator = build_orchestrator()
     console.print("[bold green]Doot[/] interactive mode. Type [bold]quit[/] or [bold]exit[/] to leave.\n")
     while True:
@@ -221,7 +202,7 @@ def _run_chat_interactive() -> None:
             break
         messages = messages + [HumanMessage(content=user_input)]
         result_messages = _invoke_and_print(orchestrator, messages)
-        _save_session(result_messages)
+        save_session(result_messages)
         messages = result_messages
 
 
@@ -235,9 +216,9 @@ def chat(message: str | None = typer.Argument(None, help="One-shot message. Omit
     orchestrator = build_orchestrator()
 
     if message:
-        messages = _load_session()
+        messages = load_session()
         result_messages = _run_once(orchestrator, message, messages)
-        _save_session(result_messages)
+        save_session(result_messages)
         return
 
     _run_chat_interactive()
@@ -281,6 +262,31 @@ def _run_once(orchestrator, message: str, initial_messages=None):
 def webhook() -> None:
     """Run the webhook server (Gmail Pub/Sub push). Alias for 'start'. Point subscription to {WEBHOOK_URL}/webhook/gmail."""
     _run_webhook()
+
+
+@app.command()
+def telegram_poll() -> None:
+    """Run the Telegram bot in polling mode (no public URL needed). Uses the same global session as CLI and webhook."""
+    import asyncio
+
+    from telegram import Update
+    from telegram.ext import Application, MessageHandler, filters
+
+    from src.webhook import process_telegram_message
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        typer.echo("Set TELEGRAM_BOT_TOKEN in .env", err=True)
+        raise typer.Exit(1)
+
+    async def handle(update: Update, context) -> None:
+        if update.message and update.message.text:
+            process_telegram_message(update.effective_chat.id, update.message.text)
+
+    application = Application.builder().token(token).build()
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle))
+    typer.echo("Telegram polling started. Send a message to your bot.")
+    asyncio.run(application.run_polling(allowed_updates=Update.ALL_TYPES))
 
 
 @app.command()
