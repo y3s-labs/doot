@@ -19,7 +19,9 @@ def gmail_list_inbox(max_results: int = 10) -> str:
         summaries.append(message_to_summary(msg))
     lines = []
     for s in summaries:
-        lines.append(f"• [{s['date']}] From: {s['from']}\n  Subject: {s['subject']}\n  {s['snippet'][:120]}")
+        lines.append(
+            f"• id={s['id']} [{s['date']}] From: {s['from']}\n  Subject: {s['subject']}\n  {s['snippet'][:120]}"
+        )
     return "\n\n".join(lines)
 
 
@@ -35,13 +37,23 @@ def gmail_search(query: str, max_results: int = 10) -> str:
         summaries.append(message_to_summary(msg))
     lines = []
     for s in summaries:
-        lines.append(f"• [{s['date']}] From: {s['from']}\n  Subject: {s['subject']}\n  {s['snippet'][:120]}")
+        lines.append(
+            f"• id={s['id']} [{s['date']}] From: {s['from']}\n  Subject: {s['subject']}\n  {s['snippet'][:120]}"
+        )
     return "\n\n".join(lines)
 
 
 @tool
 def gmail_get_email(message_id: str) -> str:
-    """Get the full content of a specific email by its message ID."""
+    """Get the full content of a specific email by its Gmail message ID.
+    The message_id must be the 'id' value from gmail_list_inbox or gmail_search (e.g. '18b2f3a1c4d5e6f7').
+    Do not use an email address or any other value—only the id field from the list results."""
+    message_id = message_id.strip()
+    if "@" in message_id or " " in message_id:
+        return (
+            f"Invalid message_id: {message_id!r}. "
+            "Use the exact 'id' value from gmail_list_inbox or gmail_search (e.g. id=18b2f3a1c4d5e6f7), not an email address."
+        )
     msg = get_message("me", message_id, format="full")
     headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
     parts_text = _extract_text(msg.get("payload", {}))

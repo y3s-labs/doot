@@ -1,10 +1,12 @@
 """CLI for Doot."""
 
+import json
 import logging
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -62,13 +64,72 @@ def _log_path() -> Path:
     return _pid_path().parent / "doot.log"
 
 
+def _session_path() -> Path:
+    """Path for persisted chat session (JSON)."""
+    base = os.getenv("DOOT_TOKENS_PATH", "~/.doot/tokens.json")
+    return Path(base).expanduser().parent / "chat_session.json"
+
+
+def _load_session():
+    """Load session messages from file. Returns list of HumanMessage/AIMessage; empty list if missing or invalid."""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    path = _session_path()
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text()
+        data = json.loads(raw) if raw.strip() else []
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Could not load session from %s: %s", path, e)
+        return []
+    out = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        role = item.get("role")
+        content = item.get("content")
+        if content is None:
+            content = ""
+        if role == "human":
+            out.append(HumanMessage(content=content))
+        elif role == "ai":
+            out.append(AIMessage(content=content))
+    return out
+
+
+def _save_session(messages) -> None:
+    """Persist message list to session file (JSON array of {role, content})."""
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    path = _session_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            rows.append({"role": "human", "content": msg.content if isinstance(msg.content, str) else str(msg.content)})
+        elif isinstance(msg, AIMessage):
+            content = msg.content
+            if isinstance(content, list):
+                content = "\n".join(
+                    block.get("text", str(block)) if isinstance(block, dict) else str(block) for block in content
+                )
+            else:
+                content = content if isinstance(content, str) else str(content)
+            rows.append({"role": "ai", "content": content})
+    path.write_text(json.dumps(rows, indent=2))
+
+
 @app.command()
 def start(
     background: bool = typer.Option(False, "--background", "-d", help="Run webhook server in background (writes PID file)."),
 ) -> None:
-    """Start Doot (webhook server for Gmail Pub/Sub). Same as running 'doot' with no command."""
+    """Start Doot: webhook server + interactive chat. Use --background for webhook-only (no chat)."""
     if not background:
-        _run_webhook()
+        thread = threading.Thread(target=_run_webhook, daemon=True)
+        thread.start()
+        time.sleep(0.5)  # let webhook bind before starting chat
+        _run_chat_interactive()
         return
 
     pid_file = _pid_path()
@@ -86,7 +147,7 @@ def start(
     log_file = _log_path()
     with open(log_file, "a") as fh:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "src.cli", "start"],
+            [sys.executable, "-m", "src.cli", "webhook"],
             cwd=os.getcwd(),
             stdout=fh,
             stderr=subprocess.STDOUT,
@@ -140,19 +201,14 @@ def auth() -> None:
     typer.echo("Credentials saved.")
 
 
-@app.command()
-def chat(message: str | None = typer.Argument(None, help="One-shot message. Omit for interactive mode.")) -> None:
-    """Talk to the Doot orchestrator (routes to Gmail agent, etc)."""
-    from langchain_core.messages import AIMessage, HumanMessage
+def _run_chat_interactive() -> None:
+    """Load session, run interactive chat loop (read input, invoke, save, print)."""
+    from langchain_core.messages import HumanMessage
 
     from src.graph.orchestrator import build_orchestrator
 
+    messages = _load_session()
     orchestrator = build_orchestrator()
-
-    if message:
-        _run_once(orchestrator, message)
-        return
-
     console.print("[bold green]Doot[/] interactive mode. Type [bold]quit[/] or [bold]exit[/] to leave.\n")
     while True:
         try:
@@ -163,30 +219,62 @@ def chat(message: str | None = typer.Argument(None, help="One-shot message. Omit
         if not user_input or user_input.lower() in ("quit", "exit"):
             console.print("Bye!")
             break
-        _run_once(orchestrator, user_input)
+        messages = messages + [HumanMessage(content=user_input)]
+        result_messages = _invoke_and_print(orchestrator, messages)
+        _save_session(result_messages)
+        messages = result_messages
 
 
-def _run_once(orchestrator, message: str):
-    from langchain_core.messages import AIMessage, HumanMessage
+@app.command()
+def chat(message: str | None = typer.Argument(None, help="One-shot message. Omit for interactive mode.")) -> None:
+    """Talk to the Doot orchestrator (routes to Gmail agent, etc). Session is loaded/saved to file."""
+    from langchain_core.messages import HumanMessage
 
-    log.info("Sending: %s", message)
-    result = orchestrator.invoke({"messages": [HumanMessage(content=message)], "route": ""})
-    log.info("Route chosen: %s", result.get("route", "?"))
-    log.debug("Full result keys: %s", list(result.keys()))
+    from src.graph.orchestrator import build_orchestrator
 
-    for msg in result["messages"]:
+    orchestrator = build_orchestrator()
+
+    if message:
+        messages = _load_session()
+        result_messages = _run_once(orchestrator, message, messages)
+        _save_session(result_messages)
+        return
+
+    _run_chat_interactive()
+
+
+def _print_last_ai(messages) -> None:
+    """Print the last AI message from a message list (for console output)."""
+    from langchain_core.messages import AIMessage
+
+    for msg in reversed(messages):
         if isinstance(msg, AIMessage) and msg.content:
             content = msg.content
-            # Anthropic can return content as a list of blocks
             if isinstance(content, list):
                 content = "\n".join(
-                    block.get("text", str(block)) if isinstance(block, dict) else str(block)
-                    for block in content
+                    block.get("text", str(block)) if isinstance(block, dict) else str(block) for block in content
                 )
-            log.debug("AI message type=%s content_type=%s", type(msg).__name__, type(msg.content).__name__)
             console.print()
             console.print(Markdown(content))
             console.print()
+            return
+
+
+def _invoke_and_print(orchestrator, messages):
+    """Invoke orchestrator with messages, print last AI reply, return result['messages']."""
+    log.info("Sending (session has %d messages)", len(messages))
+    result = orchestrator.invoke({"messages": messages, "route": ""})
+    log.info("Route chosen: %s", result.get("route", "?"))
+    _print_last_ai(result["messages"])
+    return result["messages"]
+
+
+def _run_once(orchestrator, message: str, initial_messages=None):
+    """Run one turn: optional prior messages + new user message; print AI reply; return result messages."""
+    from langchain_core.messages import HumanMessage
+
+    messages = list(initial_messages or []) + [HumanMessage(content=message)]
+    return _invoke_and_print(orchestrator, messages)
 
 
 @app.command()

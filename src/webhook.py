@@ -5,7 +5,7 @@ import json
 import logging
 import os
 
-from fastapi import FastAPI, Request
+from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 log = logging.getLogger("doot.webhook")
@@ -15,11 +15,38 @@ app = FastAPI(title="Doot webhook", version="0.1.0")
 
 def on_gmail_push(payload: dict) -> None:
     """
-    Hook for proactive actions when a Gmail push is received.
-    Default: no-op. Override or extend to send Telegram, run the Gmail agent, etc.
+    Trigger the orchestrator (which routes to Gmail agent or others): summarize the new email and suggest actions.
+    Flow: Gmail Pub/Sub webhook → Orchestrator → Gmail Agent (or other agents if needed).
     payload: decoded Gmail notification {"emailAddress": "...", "historyId": "..."}
     """
-    pass
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    from src.graph.orchestrator import build_orchestrator
+
+    prompt = (
+        "A new email just arrived. Get the most recent email from my inbox, "
+        "summarize it clearly, and suggest specific actions I can take "
+        "(e.g. reply, archive, add to calendar, follow up later)."
+    )
+    try:
+        orchestrator = build_orchestrator()
+        result = orchestrator.invoke({"messages": [HumanMessage(content=prompt)], "route": ""})
+        route = result.get("route", "?")
+        log.info("Orchestrator route on Gmail push: %s", route)
+        for msg in reversed(result.get("messages", [])):
+            if isinstance(msg, AIMessage) and msg.content:
+                content = msg.content
+                if isinstance(content, list):
+                    text_blocks = [
+                        block.get("text") for block in content
+                        if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+                    ]
+                    content = "\n".join(text_blocks) if text_blocks else ""
+                if content:
+                    log.info("Orchestrator reply: %s", content)
+                    break
+    except Exception as e:
+        log.exception("Orchestrator failed on Gmail push: %s", e)
 
 
 def _decode_gmail_notification(data: str) -> dict | None:
@@ -39,7 +66,7 @@ def _decode_gmail_notification(data: str) -> dict | None:
 
 
 @app.post("/webhook/gmail")
-async def gmail_webhook(request: Request):
+async def gmail_webhook(request: Request, background_tasks: BackgroundTasks):
     """
     Receive Gmail Pub/Sub push notifications.
     Body: { "message": { "data": "<base64url>", "messageId": "...", ... }, "subscription": "..." }
@@ -74,12 +101,12 @@ async def gmail_webhook(request: Request):
         )
 
     if payload:
-        on_gmail_push(payload)
+        background_tasks.add_task(on_gmail_push, payload)
 
     # 200 = acknowledge so Pub/Sub does not retry
     return JSONResponse(
         status_code=200,
-        content={"ok": True, "emailAddress": payload.get("emailAddress"), "historyId": payload.get("historyId")},
+        content={"ok": True, "emailAddress": (payload or {}).get("emailAddress"), "historyId": (payload or {}).get("historyId")},
     )
 
 
