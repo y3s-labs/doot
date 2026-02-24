@@ -10,6 +10,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 
+from src.agents.calendar.agent import create_calendar_agent
 from src.agents.gmail.agent import create_gmail_agent
 
 log = logging.getLogger("doot.orchestrator")
@@ -26,8 +27,9 @@ ROUTER_SYSTEM = SystemMessage(
         "You are a routing assistant. Given the user's message, decide which agent should handle it.\n"
         "Available agents:\n"
         "  - gmail: anything about emails, inbox, messages, mail\n"
+        "  - calendar: anything about calendar, events, meetings, schedule, appointments\n"
         "  - none: if you can answer directly without any agent\n\n"
-        "Respond with ONLY the agent name (gmail or none) and nothing else."
+        "Respond with ONLY the agent name (gmail, calendar, or none) and nothing else."
     )
 )
 
@@ -59,7 +61,12 @@ def route_node(state: OrchestratorState) -> OrchestratorState:
         return {**state, "route": "none"}
     response = llm.invoke([ROUTER_SYSTEM, last_user_msg])
     raw_route = response.content.strip().lower() if isinstance(response.content, str) else str(response.content)
-    route = "gmail" if "gmail" in raw_route else "none"
+    if "gmail" in raw_route:
+        route = "gmail"
+    elif "calendar" in raw_route:
+        route = "calendar"
+    else:
+        route = "none"
     log.info("Router: raw=%r → route=%s", raw_route, route)
     return {**state, "route": route}
 
@@ -70,6 +77,15 @@ def gmail_node(state: OrchestratorState) -> OrchestratorState:
     agent = create_gmail_agent()
     result = agent.invoke({"messages": state["messages"]})
     log.info("Gmail agent: done, %d messages in result", len(result["messages"]))
+    return {**state, "messages": result["messages"]}
+
+
+def calendar_node(state: OrchestratorState) -> OrchestratorState:
+    """Run the Calendar agent on the user's messages."""
+    log.info("Calendar agent: running...")
+    agent = create_calendar_agent()
+    result = agent.invoke({"messages": state["messages"]})
+    log.info("Calendar agent: done, %d messages in result", len(result["messages"]))
     return {**state, "messages": result["messages"]}
 
 
@@ -96,11 +112,17 @@ def build_orchestrator() -> StateGraph:
 
     graph.add_node("router", route_node)
     graph.add_node("gmail", gmail_node)
+    graph.add_node("calendar", calendar_node)
     graph.add_node("direct", direct_node)
 
     graph.set_entry_point("router")
-    graph.add_conditional_edges("router", pick_agent, {"gmail": "gmail", "none": "direct"})
+    graph.add_conditional_edges(
+        "router",
+        pick_agent,
+        {"gmail": "gmail", "calendar": "calendar", "none": "direct"},
+    )
     graph.add_edge("gmail", END)
+    graph.add_edge("calendar", END)
     graph.add_edge("direct", END)
 
     return graph.compile()
