@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timezone
 from typing import TypedDict
 
 from langchain_anthropic import ChatAnthropic
@@ -12,6 +13,7 @@ from langgraph.graph import END, StateGraph
 
 from src.agents.calendar.agent import create_calendar_agent
 from src.agents.gmail.agent import create_gmail_agent
+from src.agents.websearch.agent import create_websearch_agent
 
 log = logging.getLogger("doot.orchestrator")
 
@@ -28,8 +30,9 @@ ROUTER_SYSTEM = SystemMessage(
         "Available agents:\n"
         "  - gmail: anything about emails, inbox, messages, mail\n"
         "  - calendar: anything about calendar, events, meetings, schedule, appointments\n"
+        "  - websearch: look up current info, search the web, recent events, facts, \"what is\", \"who won\", news\n"
         "  - none: if you can answer directly without any agent\n\n"
-        "Respond with ONLY the agent name (gmail, calendar, or none) and nothing else."
+        "Respond with ONLY the agent name (gmail, calendar, websearch, or none) and nothing else."
     )
 )
 
@@ -65,6 +68,8 @@ def route_node(state: OrchestratorState) -> OrchestratorState:
         route = "gmail"
     elif "calendar" in raw_route:
         route = "calendar"
+    elif "websearch" in raw_route or "web_search" in raw_route:
+        route = "websearch"
     else:
         route = "none"
     log.info("Router: raw=%r → route=%s", raw_route, route)
@@ -89,6 +94,30 @@ def calendar_node(state: OrchestratorState) -> OrchestratorState:
     return {**state, "messages": result["messages"]}
 
 
+def websearch_node(state: OrchestratorState) -> OrchestratorState:
+    """Run the Web Search (Gemini grounding) agent on the user's messages."""
+    log.info("Web search agent: running...")
+    agent = create_websearch_agent()
+    result = agent.invoke({"messages": state["messages"]})
+    log.info("Web search agent: done, %d messages in result", len(result["messages"]))
+    return {**state, "messages": result["messages"]}
+
+
+def _direct_system_message() -> SystemMessage:
+    """System message with current date/time so the model can answer 'what is today?' etc."""
+    now = datetime.now(timezone.utc)
+    today_iso = now.strftime("%Y-%m-%d")
+    today_readable = now.strftime("%A, %B %d, %Y")
+    time_utc = now.strftime("%H:%M UTC")
+    return SystemMessage(
+        content=(
+            f"Current date and time: {today_readable}. "
+            f"Date in ISO form: {today_iso}. Time: {time_utc}. "
+            "Use this when the user asks about today, the current date, or the current time."
+        )
+    )
+
+
 def direct_node(state: OrchestratorState) -> OrchestratorState:
     """Answer directly without an agent."""
     log.info("Direct node: answering without agent...")
@@ -97,7 +126,8 @@ def direct_node(state: OrchestratorState) -> OrchestratorState:
         anthropic_api_key=_anthropic_api_key(),
         max_tokens=4096,
     )
-    response = llm.invoke(state["messages"])
+    messages = [_direct_system_message()] + list(state["messages"])
+    response = llm.invoke(messages)
     return {**state, "messages": state["messages"] + [response]}
 
 
@@ -113,16 +143,18 @@ def build_orchestrator() -> StateGraph:
     graph.add_node("router", route_node)
     graph.add_node("gmail", gmail_node)
     graph.add_node("calendar", calendar_node)
+    graph.add_node("websearch", websearch_node)
     graph.add_node("direct", direct_node)
 
     graph.set_entry_point("router")
     graph.add_conditional_edges(
         "router",
         pick_agent,
-        {"gmail": "gmail", "calendar": "calendar", "none": "direct"},
+        {"gmail": "gmail", "calendar": "calendar", "websearch": "websearch", "none": "direct"},
     )
     graph.add_edge("gmail", END)
     graph.add_edge("calendar", END)
+    graph.add_edge("websearch", END)
     graph.add_edge("direct", END)
 
     return graph.compile()

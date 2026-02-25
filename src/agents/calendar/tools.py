@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from googleapiclient.errors import HttpError
 from langchain_core.tools import tool
 
 from src.agents.calendar.client import (
@@ -46,7 +47,16 @@ def calendar_get_event(event_id: str, calendar_id: str = "primary") -> str:
     """Get full details of a single calendar event by its ID.
     Use the id from calendar_list_events (e.g. a long string like 'abc123...')."""
     event_id = event_id.strip()
-    ev = get_event(calendar_id, event_id)
+    try:
+        ev = get_event(calendar_id, event_id)
+    except HttpError as e:
+        if e.resp.status == 404:
+            id_preview = event_id[:50] + "..." if len(event_id) > 50 else event_id
+            return (
+                f"Event id={id_preview} not found. It may have been deleted or the id may be stale. "
+                "Use calendar_list_events to get current events and ids."
+            )
+        raise
     s = event_to_summary(ev)
     lines = [
         f"Summary: {s['summary']}",
@@ -91,8 +101,16 @@ def calendar_create_event(
 def calendar_delete_event(event_id: str, calendar_id: str = "primary") -> str:
     """Delete a calendar event by its ID. Use the id from calendar_list_events."""
     event_id = event_id.strip()
-    delete_event(calendar_id, event_id)
-    return f"Deleted event id={event_id}."
+    try:
+        delete_event(calendar_id, event_id)
+        return f"Deleted event id={event_id}."
+    except HttpError as e:
+        if e.resp.status == 404:
+            return (
+                f"Event id={event_id} not found. It may have been deleted already, "
+                "or the id may be from a different calendar. List events to get current ids."
+            )
+        raise
 
 
 ALL_TOOLS = [

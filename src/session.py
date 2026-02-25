@@ -11,9 +11,11 @@ log = logging.getLogger("doot.session")
 
 
 def session_path() -> Path:
-    """Path for persisted chat session (JSON)."""
-    base = os.getenv("DOOT_TOKENS_PATH", "~/.doot/tokens.json")
-    return Path(base).expanduser().parent / "chat_session.json"
+    """Path for persisted chat session (JSON). Defaults to project .doot/ so it survives container rebuilds."""
+    explicit = os.getenv("DOOT_SESSION_PATH")
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.cwd() / ".doot" / "chat_session.json"
 
 
 def load_session() -> list:

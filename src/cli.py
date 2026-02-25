@@ -29,6 +29,8 @@ logging.basicConfig(
     format="%(name)s: %(message)s",
     handlers=[RichHandler(rich_tracebacks=True, show_path=False)],
 )
+# Reduce noise from google-genai (e.g. "AFC is enabled with max remote calls: 10")
+logging.getLogger("google_genai.models").setLevel(logging.WARNING)
 log = logging.getLogger("doot")
 
 app = typer.Typer(no_args_is_help=True)
@@ -303,6 +305,32 @@ def watch_gmail() -> None:
     result = watch(topic_name=topic, label_ids=["INBOX"])
     typer.echo(f"Watch registered: historyId={result.get('historyId')} expiration={result.get('expiration')}")
     typer.echo("Send yourself a test email; you should see a POST on your webhook.")
+
+
+@app.command(name="check-gemini")
+def check_gemini() -> None:
+    """Verify GEMINI_API_KEY is set and accepted by the Gemini API (for web search)."""
+    raw = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+    key = raw.strip().strip('"').strip("'")
+    if not key:
+        typer.echo("GEMINI_API_KEY (or GOOGLE_API_KEY) is not set. Add it to .env from https://aistudio.google.com/apikey", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Key is set (length {len(key)}). Calling Gemini API...")
+    try:
+        from src.agents.websearch.client import _get_client
+        from google.genai import types
+        client = _get_client()
+        # Minimal call without search to validate the key (same model as websearch agent)
+        response = client.models.generate_content(
+            model="gemini-flash-lite-latest",
+            contents="Reply with exactly: OK",
+            config=types.GenerateContentConfig(max_output_tokens=10),
+        )
+        text = (response.text or "").strip()
+        typer.echo("Gemini API key is valid." if text else "Got empty response (key may still work).")
+    except Exception as e:
+        typer.echo(f"Gemini API error: {e}", err=True)
+        raise typer.Exit(1)
 
 
 @app.command()

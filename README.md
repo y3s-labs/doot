@@ -6,7 +6,8 @@
 
 - **Auth** — OAuth2 flow for Gmail (and Calendar scope) with a local callback server or paste-URL fallback for dev containers.
 - **Gmail agent** — Lists inbox, searches mail, and fetches full messages via the Gmail API.
-- **Orchestrator** — Routes your message to the right agent (e.g. “show my last 5 emails” → Gmail agent).
+- **Orchestrator** — Routes your message to the right agent (e.g. “show my last 5 emails” → Gmail; “what’s on my calendar?” → Calendar; “who won the World Cup?” → Web search).
+- **Web search agent** — Gemini with Google Search grounding for real-time web lookups and citations.
 - **Chat CLI** — One-shot or interactive: ask in plain language and get answers.
 - **Telegram bot** — Chat with the same orchestrator from Telegram; shares the global session with the CLI.
 
@@ -24,9 +25,10 @@
    Create a `.env` file with:
 
    - `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` — from [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials → OAuth 2.0 Client (e.g. Desktop app), and add `http://localhost:8080` as a redirect URI.
-   - `ANTHROPIC_API_KEY` — for the orchestrator and Gmail agent.
+   - `ANTHROPIC_API_KEY` — for the orchestrator and Gmail/Calendar agents.
+   - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — for the web search agent (Gemini + Google Search grounding). Get a key from [Google AI Studio](https://aistudio.google.com/apikey).
 
-   Optional: `DOOT_TOKENS_PATH`, `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`. For Telegram: `TELEGRAM_BOT_TOKEN` (required for the bot), `TELEGRAM_WEBHOOK_BASE_URL` (e.g. `https://yourdomain.com`) to auto-register the webhook when the server starts.
+   Optional: `DOOT_TOKENS_PATH`, `DOOT_SESSION_PATH` (default: `.doot/chat_session.json` in project), `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`. For Telegram: `TELEGRAM_BOT_TOKEN` (required for the bot), `TELEGRAM_WEBHOOK_BASE_URL` (e.g. `https://yourdomain.com`) to auto-register the webhook when the server starts.
 
 3. **Authenticate**
 
@@ -56,6 +58,7 @@
 
   ```bash
   python -m src.cli auth    # (re)auth Gmail/Calendar
+  python -m src.cli check-gemini  # verify Gemini API key (for web search)
   python -m src.cli version # show version
   python -m src.cli --help  # list commands
   ```
@@ -109,13 +112,15 @@ src/
   session.py          # Global chat session load/save (CLI + Telegram)
   orchestrator_runner.py  # invoke_orchestrator(messages) → (result, last_ai_text)
   graph/
-    orchestrator.py   # Router + graph (router → gmail | direct → END)
+    orchestrator.py   # Router + graph (router → gmail | calendar | websearch | direct → END)
   agents/
     gmail/
       auth.py         # OAuth2 credentials (tokens in ~/.doot/tokens.json)
       client.py       # Gmail API client (list, get messages)
       tools.py        # LangChain tools (gmail_list_inbox, gmail_search, gmail_get_email)
       agent.py        # ReAct agent (Claude + Gmail tools)
+    calendar/         # Google Calendar (list/create/delete events)
+    websearch/        # Gemini + Google Search grounding (client.py, agent.py)
 ```
 
 ## License

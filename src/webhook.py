@@ -13,8 +13,10 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from src.session import load_session, save_session, session_path
+from src.utils.telegram_format import format_orchestrator_reply_for_telegram
 
 log = logging.getLogger("doot.webhook")
+
 
 # File to store last Telegram chat_id so Gmail push summaries can be sent to the same chat
 def _telegram_chat_id_path() -> Path:
@@ -45,8 +47,12 @@ def _set_last_telegram_chat_id(chat_id: int) -> None:
     path.write_text(str(chat_id))
 
 
-def _send_telegram_text(chat_id: int, text: str) -> None:
-    """Send a text message to a Telegram chat. Truncates to TELEGRAM_MAX_MESSAGE_LENGTH."""
+def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegram: bool = False) -> None:
+    """
+    Send a text message to a Telegram chat.
+    If already_formatted_for_telegram is True, text is Telegram HTML and is sent with parse_mode=HTML.
+    Otherwise text is treated as plain (no HTML). Truncates to TELEGRAM_MAX_MESSAGE_LENGTH.
+    """
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         log.warning("TELEGRAM_BOT_TOKEN not set; skipping send")
@@ -55,8 +61,12 @@ def _send_telegram_text(chat_id: int, text: str) -> None:
         text = text[: TELEGRAM_MAX_MESSAGE_LENGTH - 3] + "..."
     async def _send() -> None:
         from telegram import Bot
+        from telegram.constants import ParseMode
         bot = Bot(token=token)
-        await bot.send_message(chat_id=chat_id, text=text)
+        kwargs = {"chat_id": chat_id, "text": text}
+        if already_formatted_for_telegram:
+            kwargs["parse_mode"] = ParseMode.HTML
+        await bot.send_message(**kwargs)
     asyncio.run(_send())
 
 app = FastAPI(title="Doot webhook", version="0.1.0")
@@ -132,9 +142,14 @@ def on_gmail_push(payload: dict) -> None:
             chat_id = _get_gmail_push_chat_id()
             if chat_id:
                 try:
-                    _send_telegram_text(chat_id, last_ai_text.strip())
+                    formatted = format_orchestrator_reply_for_telegram(last_ai_text.strip())
+                    _send_telegram_text(chat_id, formatted, already_formatted_for_telegram=True)
                     log.info("Gmail summary sent to Telegram chat_id=%s", chat_id)
                 except Exception as send_err:
+                    try:
+                        _send_telegram_text(chat_id, last_ai_text.strip())
+                    except Exception:
+                        pass
                     log.exception("Failed to send Gmail summary to Telegram: %s", send_err)
             else:
                 log.debug("No TELEGRAM_CHAT_ID or stored chat_id; Gmail summary not sent to Telegram")
@@ -219,7 +234,12 @@ def process_telegram_message(chat_id: int, text: str) -> None:
         save_session(result.get("messages", []))
 
         reply = (last_ai_text or "No reply generated.").strip()
-        _send_telegram_text(chat_id, reply)
+        try:
+            reply = format_orchestrator_reply_for_telegram(reply)
+            _send_telegram_text(chat_id, reply, already_formatted_for_telegram=True)
+        except Exception as fmt_err:
+            log.warning("Telegram formatting failed, sending plain: %s", fmt_err)
+            _send_telegram_text(chat_id, (last_ai_text or "No reply generated.").strip())
     except Exception as e:
         log.exception("Telegram message failed: %s", e)
         try:

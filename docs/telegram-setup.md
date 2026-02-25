@@ -134,6 +134,6 @@ If something goes wrong, the bot may reply with a short error message; check the
   - Ensure port 8000 is open and the app is listening.
 
 - **Session is empty or different from CLI**
-  - The bot uses the same session file as the CLI (e.g. `~/.doot/chat_session.json` or path from `DOOT_TOKENS_PATH`). If you run CLI and bot on different machines or different `DOOT_TOKENS_PATH`, they will have different sessions.
+  - The bot uses the same session file as the CLI (default: `.doot/chat_session.json` in the project directory, or `DOOT_SESSION_PATH` if set). If you run CLI and bot on different machines or different working directories, they will have different sessions unless you set `DOOT_SESSION_PATH` to a shared path.
 
 For more on the webhook server and Gmail push, see [setup-gmail-pubsub.md](setup-gmail-pubsub.md).
