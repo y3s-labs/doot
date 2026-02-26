@@ -58,6 +58,12 @@ def get_message(user_id: str, msg_id: str, *, format: str = "metadata"):
     )
 
 
+def trash_message(user_id: str, msg_id: str) -> dict:
+    """Move a message to Trash. Requires gmail.modify scope."""
+    service = get_gmail_service()
+    return service.users().messages().trash(userId=user_id, id=msg_id).execute()
+
+
 def message_to_summary(msg: dict) -> dict:
     """Extract subject, from, date, snippet, id from a Gmail message (metadata format)."""
     headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}

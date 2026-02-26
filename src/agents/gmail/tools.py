@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from googleapiclient.errors import HttpError
 from langchain_core.tools import tool
 
-from src.agents.gmail.client import get_message, list_messages, message_to_summary
+from src.agents.gmail.client import get_message, list_messages, message_to_summary, trash_message
+
+# Message shown when Gmail returns 404 (message deleted, trashed, or ID from old conversation)
+_MSG_NOT_FOUND = (
+    "That message was not found. It may have been deleted or moved, or the ID may be from an earlier conversation. "
+    "Use gmail_list_inbox or gmail_search now to get current message IDs, then retry."
+)
 
 
 @tool
@@ -15,8 +22,15 @@ def gmail_list_inbox(max_results: int = 10) -> str:
         return "No messages found in inbox."
     summaries = []
     for stub in msgs:
-        msg = get_message("me", stub["id"], format="metadata")
-        summaries.append(message_to_summary(msg))
+        try:
+            msg = get_message("me", stub["id"], format="metadata")
+            summaries.append(message_to_summary(msg))
+        except HttpError as e:
+            if e.resp.status == 404:
+                continue  # skip deleted/moved message
+            raise
+    if not summaries:
+        return "No messages found in inbox (or listed messages were deleted)."
     lines = []
     for s in summaries:
         lines.append(
@@ -33,8 +47,15 @@ def gmail_search(query: str, max_results: int = 10) -> str:
         return f"No messages found for query: {query}"
     summaries = []
     for stub in msgs:
-        msg = get_message("me", stub["id"], format="metadata")
-        summaries.append(message_to_summary(msg))
+        try:
+            msg = get_message("me", stub["id"], format="metadata")
+            summaries.append(message_to_summary(msg))
+        except HttpError as e:
+            if e.resp.status == 404:
+                continue
+            raise
+    if not summaries:
+        return f"No messages found for query: {query} (or they were deleted)."
     lines = []
     for s in summaries:
         lines.append(
@@ -54,7 +75,12 @@ def gmail_get_email(message_id: str) -> str:
             f"Invalid message_id: {message_id!r}. "
             "Use the exact 'id' value from gmail_list_inbox or gmail_search (e.g. id=18b2f3a1c4d5e6f7), not an email address."
         )
-    msg = get_message("me", message_id, format="full")
+    try:
+        msg = get_message("me", message_id, format="full")
+    except HttpError as e:
+        if e.resp.status == 404:
+            return _MSG_NOT_FOUND
+        return f"Gmail API error ({e.resp.status}): {e}"
     headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
     parts_text = _extract_text(msg.get("payload", {}))
     return (
@@ -64,6 +90,27 @@ def gmail_get_email(message_id: str) -> str:
         f"Subject: {headers.get('subject', '?')}\n\n"
         f"{parts_text or msg.get('snippet', '')}"
     )
+
+
+@tool
+def gmail_trash_email(message_id: str) -> str:
+    """Move an email to Trash (delete from inbox). The message_id must be the 'id' from gmail_list_inbox or gmail_search (e.g. '18b2f3a1c4d5e6f7').
+    Use this when the user asks to delete, remove, or trash an email. Do not use an email address—only the id from list/search results."""
+    message_id = message_id.strip()
+    if "@" in message_id or " " in message_id:
+        return (
+            f"Invalid message_id: {message_id!r}. "
+            "Use the exact 'id' value from gmail_list_inbox or gmail_search (e.g. id=18b2f3a1c4d5e6f7), not an email address."
+        )
+    try:
+        trash_message("me", message_id)
+        return f"Email {message_id} moved to Trash."
+    except HttpError as e:
+        if e.resp.status == 404:
+            return _MSG_NOT_FOUND
+        return f"Gmail API error ({e.resp.status}): {e}"
+    except Exception as e:
+        return f"Failed to trash email: {e}"
 
 
 def _extract_text(payload: dict) -> str:
@@ -80,4 +127,4 @@ def _extract_text(payload: dict) -> str:
     return ""
 
 
-ALL_TOOLS = [gmail_list_inbox, gmail_search, gmail_get_email]
+ALL_TOOLS = [gmail_list_inbox, gmail_search, gmail_get_email, gmail_trash_email]

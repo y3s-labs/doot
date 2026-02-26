@@ -339,5 +339,42 @@ def version() -> None:
     typer.echo("0.1.0")
 
 
+# OpenClaw-style memory CLI
+memory_app = typer.Typer(help="OpenClaw-style memory (MEMORY.md + daily logs).")
+
+
+@memory_app.command("status")
+def memory_status() -> None:
+    """Show memory workspace path and which files exist (MEMORY.md, memory/YYYY-MM-DD.md)."""
+    from src.memory.claw_store import get_memory_root, get_today_yesterday_paths
+
+    root = get_memory_root()
+    typer.echo(f"Memory root: {root}")
+    mem_path = root / "MEMORY.md"
+    typer.echo(f"  MEMORY.md: {'exists' if mem_path.exists() else 'missing'}")
+    today_path, yesterday_path = get_today_yesterday_paths()
+    for label, p in [("Today", today_path), ("Yesterday", yesterday_path)]:
+        full = root / p
+        typer.echo(f"  {p}: {'exists' if full.exists() else 'missing'}")
+
+
+@memory_app.command("search")
+def memory_search_cli(query: str = typer.Argument(..., help="Search phrase (keyword match).")) -> None:
+    """Search memory by keyword. Prints matching snippets with path and line numbers."""
+    from src.memory.claw_store import memory_keyword_search
+
+    results = memory_keyword_search(query, max_results=15)
+    if not results:
+        typer.echo(f"No matches for: {query}")
+        return
+    for r in results:
+        typer.echo(f"--- {r['path']} (lines {r['start_line']}-{r['end_line']}) ---")
+        typer.echo(r["snippet"])
+        typer.echo()
+
+
+app.add_typer(memory_app, name="memory")
+
+
 if __name__ == "__main__":
     app()

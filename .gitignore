@@ -3,3 +3,4 @@ __pycache__/
 .env
 .doot/
 agent_context/
+agent_memory/
