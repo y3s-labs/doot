@@ -10,6 +10,7 @@
 - **Web search agent** — Gemini with Google Search grounding for real-time web lookups and citations.
 - **Chat CLI** — One-shot or interactive: ask in plain language and get answers.
 - **Telegram bot** — Chat with the same orchestrator from Telegram; shares the global session with the CLI.
+- **OpenClaw-style memory** — One shared memory store: `MEMORY.md` (long-term facts and preferences) and `memory/YYYY-MM-DD.md` (daily logs). Loaded at session start; the main (direct) agent has tools to read and write memory (`memory_get`, `memory_search`, `memory_append`). Optional per-agent memory (identity, skills, failures, working) for Gmail and Calendar agents.
 
 ## Setup
 
@@ -28,7 +29,7 @@
    - `ANTHROPIC_API_KEY` — for the orchestrator and Gmail/Calendar agents.
    - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — for the web search agent (Gemini + Google Search grounding). Get a key from [Google AI Studio](https://aistudio.google.com/apikey).
 
-   Optional: `DOOT_TOKENS_PATH`, `DOOT_SESSION_PATH` (default: `.doot/chat_session.json` in project), `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`. For Telegram: `TELEGRAM_BOT_TOKEN` (required for the bot), `TELEGRAM_WEBHOOK_BASE_URL` (e.g. `https://yourdomain.com`) to auto-register the webhook when the server starts.
+   Optional: `DOOT_TOKENS_PATH`, `DOOT_SESSION_PATH` (default: `.doot/chat_session.json` in project), `DOOT_MEMORY_DIR` (default: `.doot/` for OpenClaw-style memory files), `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`. For Telegram: `TELEGRAM_BOT_TOKEN` (required for the bot), `TELEGRAM_WEBHOOK_BASE_URL` (e.g. `https://yourdomain.com`) to auto-register the webhook when the server starts.
 
 3. **Authenticate**
 
@@ -45,6 +46,20 @@
    - Put any intro or notes at the top; the text **after** the first `---` line is what the bot uses as context.
    - The `agent_context/` folder is in `.gitignore`, so your custom context is not committed.
    - If the file or folder is missing, the bot still runs with no custom context.
+
+5. **Memory (OpenClaw-style, optional)**
+
+   Memory lives under `.doot/` (or `DOOT_MEMORY_DIR`):
+
+   - **`MEMORY.md`** — Long-term facts and preferences. The bot can read and append via tools; you can edit by hand.
+   - **`memory/YYYY-MM-DD.md`** — One daily log per day (e.g. `memory/2026-02-26.md`). Append-only; the bot sees today and yesterday at the start of each turn.
+
+   The main (direct) agent has tools: `memory_get` (read a file), `memory_search` (keyword search), `memory_append` (append to MEMORY.md or a daily log). So you can say “remember that I prefer short answers” or “what did we decide about X?” and it will use memory. From the CLI:
+
+   ```bash
+   python -m src.cli memory status   # show memory root and which files exist
+   python -m src.cli memory search "prefer"   # keyword search over memory
+   ```
 
 ## Usage
 
@@ -67,6 +82,8 @@
   ```bash
   python -m src.cli auth    # (re)auth Gmail/Calendar
   python -m src.cli check-gemini  # verify Gemini API key (for web search)
+  python -m src.cli memory status   # OpenClaw-style memory: show root and files
+  python -m src.cli memory search "query"   # keyword search over MEMORY.md and daily logs
   python -m src.cli version # show version
   python -m src.cli --help  # list commands
   ```
@@ -115,13 +132,16 @@
 
 ```
 agent_context/        # (optional, gitignored) agent_context.md = global context for all agents
+agent_memory/         # (optional) per-agent identity/skills/failures/working for Gmail, Calendar, etc.
+.doot/                # session, memory (default: chat_session.json, MEMORY.md, memory/YYYY-MM-DD.md)
 src/
-  cli.py              # Entrypoint: auth, chat, start (--background), stop, webhook, watch-gmail, version
+  cli.py              # Entrypoint: auth, chat, start (--background), stop, webhook, watch-gmail, memory, version
   webhook.py          # FastAPI: POST /webhook/gmail, POST /webhook/telegram; Gmail push + Telegram bot
   session.py          # Global chat session load/save (CLI + Telegram)
   orchestrator_runner.py  # invoke_orchestrator(messages) → (result, last_ai_text)
   graph/
     orchestrator.py   # Router + graph (router → gmail | calendar | websearch | direct → END)
+  memory/             # OpenClaw-style: claw_store.py, claw_tools.py; per-agent: service.py, loader.py, saver.py
   agents/
     gmail/
       auth.py         # OAuth2 credentials (tokens in ~/.doot/tokens.json)

@@ -11,12 +11,22 @@ from typing import TypedDict
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
+from langgraph.prebuilt import create_react_agent
 
 from src.agents.calendar.agent import create_calendar_agent
 from src.agents.gmail.agent import create_gmail_agent
 from src.agents.websearch.agent import create_websearch_agent
+from src.memory import AgentMemoryService, save_agent_memory
+from src.memory.claw_store import load_memory_for_context
+from src.memory.claw_tools import CLAW_MEMORY_TOOLS
 
 log = logging.getLogger("doot.orchestrator")
+
+# Shared per-agent memory service (identity, skills, failures, working)
+_memory_service = AgentMemoryService()
+# Task ID for working memory; no explicit tasks in chat flow, so one session-scoped working memory.
+# Call memory_service.clear_working_memory(_MEMORY_TASK_ID) when a task fully completes (e.g. from CLI).
+_MEMORY_TASK_ID = "session"
 
 # Path to agent_context/ (not committed; see .gitignore)
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -36,8 +46,12 @@ def _load_agent_context() -> str:
 
 
 def _global_context_message() -> SystemMessage:
-    """System message with current agent context (loaded from file)."""
-    return SystemMessage(content=_load_agent_context())
+    """System message with agent_context.md + OpenClaw-style memory (MEMORY.md + today/yesterday)."""
+    context = _load_agent_context()
+    claw_memory = load_memory_for_context()
+    parts = [context] if context else []
+    parts.append(claw_memory)
+    return SystemMessage(content="\n\n".join(parts))
 
 
 def _anthropic_api_key() -> str | None:
@@ -73,13 +87,9 @@ def _build_router_llm():
 
 
 def inject_global_context(state: OrchestratorState) -> OrchestratorState:
-    """Prepend global agent context to every conversation (from agent_context.md)."""
-    context = _load_agent_context()
+    """Prepend global agent context (agent_context.md + OpenClaw memory) to every conversation."""
     messages = list(state["messages"])
-    if context and messages and isinstance(messages[0], SystemMessage) and messages[0].content == context:
-        return state
-    if not context:
-        return state
+    # Always prepend so that OpenClaw memory (MEMORY.md + today/yesterday) is fresh each turn
     return {**state, "messages": [_global_context_message()] + messages}
 
 
@@ -112,18 +122,20 @@ def route_node(state: OrchestratorState) -> OrchestratorState:
 def gmail_node(state: OrchestratorState) -> OrchestratorState:
     """Run the Gmail agent on the user's messages."""
     log.info("Gmail agent: running...")
-    agent = create_gmail_agent()
+    agent = create_gmail_agent(task_id=_MEMORY_TASK_ID, memory_service=_memory_service)
     result = agent.invoke({"messages": state["messages"]})
     log.info("Gmail agent: done, %d messages in result", len(result["messages"]))
+    save_agent_memory(_memory_service, "gmail", _MEMORY_TASK_ID, result)
     return {**state, "messages": result["messages"]}
 
 
 def calendar_node(state: OrchestratorState) -> OrchestratorState:
     """Run the Calendar agent on the user's messages."""
     log.info("Calendar agent: running...")
-    agent = create_calendar_agent()
+    agent = create_calendar_agent(task_id=_MEMORY_TASK_ID, memory_service=_memory_service)
     result = agent.invoke({"messages": state["messages"]})
     log.info("Calendar agent: done, %d messages in result", len(result["messages"]))
+    save_agent_memory(_memory_service, "calendar", _MEMORY_TASK_ID, result)
     return {**state, "messages": result["messages"]}
 
 
@@ -151,17 +163,27 @@ def _direct_system_message() -> SystemMessage:
     )
 
 
-def direct_node(state: OrchestratorState) -> OrchestratorState:
-    """Answer directly without an agent."""
-    log.info("Direct node: answering without agent...")
+def _build_direct_agent():
+    """ReAct agent for direct replies with memory tools (memory_get, memory_search, memory_append)."""
     llm = ChatAnthropic(
         model="claude-sonnet-4-20250514",
         anthropic_api_key=_anthropic_api_key(),
         max_tokens=4096,
     )
-    messages = [_direct_system_message()] + list(state["messages"])
-    response = llm.invoke(messages)
-    return {**state, "messages": state["messages"] + [response]}
+    return create_react_agent(
+        llm,
+        tools=CLAW_MEMORY_TOOLS,
+        prompt=_direct_system_message(),
+    )
+
+
+def direct_node(state: OrchestratorState) -> OrchestratorState:
+    """Answer directly using a ReAct agent with memory tools (read/write MEMORY.md and daily logs)."""
+    log.info("Direct node: running with memory tools...")
+    agent = _build_direct_agent()
+    result = agent.invoke({"messages": state["messages"]})
+    log.info("Direct node: done, %d messages in result", len(result["messages"]))
+    return {**state, "messages": result["messages"]}
 
 
 def pick_agent(state: OrchestratorState) -> str:

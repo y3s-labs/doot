@@ -10,6 +10,7 @@ from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import create_react_agent
 
 from src.agents.calendar.tools import ALL_TOOLS
+from src.memory import AgentMemoryService, make_memory_modifier
 
 
 def _build_system_prompt() -> SystemMessage:
@@ -33,8 +34,8 @@ def _build_system_prompt() -> SystemMessage:
     )
 
 
-def create_calendar_agent():
-    """Create a ReAct agent with Google Calendar tools."""
+def create_calendar_agent(task_id: str = "session", memory_service: AgentMemoryService | None = None):
+    """Create a ReAct agent with Google Calendar tools and per-agent memory (identity, skills, failures, working)."""
     raw = (os.getenv("ANTHROPIC_API_KEY") or "").strip() or None
     llm = ChatAnthropic(
         model="claude-sonnet-4-20250514",
@@ -45,4 +46,5 @@ def create_calendar_agent():
         llm,
         tools=ALL_TOOLS,
         prompt=_build_system_prompt(),
+        pre_model_hook=make_memory_modifier("calendar", task_id, memory_service),
     )
