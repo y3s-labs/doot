@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TypedDict
 
 from langchain_anthropic import ChatAnthropic
@@ -16,6 +17,27 @@ from src.agents.gmail.agent import create_gmail_agent
 from src.agents.websearch.agent import create_websearch_agent
 
 log = logging.getLogger("doot.orchestrator")
+
+# Path to agent_context/ (not committed; see .gitignore)
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+AGENT_CONTEXT_PATH = _PROJECT_ROOT / "agent_context" / "agent_context.md"
+
+
+def _load_agent_context() -> str:
+    """Load global agent context from agent_context.md. Content after '---' is used as the context."""
+    if not AGENT_CONTEXT_PATH.exists():
+        log.warning("agent_context.md not found at %s; using empty context", AGENT_CONTEXT_PATH)
+        return ""
+    raw = AGENT_CONTEXT_PATH.read_text(encoding="utf-8").strip()
+    if "---" in raw:
+        _, _, body = raw.partition("---")
+        return body.strip()
+    return raw
+
+
+def _global_context_message() -> SystemMessage:
+    """System message with current agent context (loaded from file)."""
+    return SystemMessage(content=_load_agent_context())
 
 
 def _anthropic_api_key() -> str | None:
@@ -48,6 +70,17 @@ def _build_router_llm():
         anthropic_api_key=_anthropic_api_key(),
         max_tokens=50,
     )
+
+
+def inject_global_context(state: OrchestratorState) -> OrchestratorState:
+    """Prepend global agent context to every conversation (from agent_context.md)."""
+    context = _load_agent_context()
+    messages = list(state["messages"])
+    if context and messages and isinstance(messages[0], SystemMessage) and messages[0].content == context:
+        return state
+    if not context:
+        return state
+    return {**state, "messages": [_global_context_message()] + messages}
 
 
 def route_node(state: OrchestratorState) -> OrchestratorState:
@@ -140,13 +173,15 @@ def build_orchestrator() -> StateGraph:
     """Build and compile the orchestrator graph."""
     graph = StateGraph(OrchestratorState)
 
+    graph.add_node("inject_context", inject_global_context)
     graph.add_node("router", route_node)
     graph.add_node("gmail", gmail_node)
     graph.add_node("calendar", calendar_node)
     graph.add_node("websearch", websearch_node)
     graph.add_node("direct", direct_node)
 
-    graph.set_entry_point("router")
+    graph.set_entry_point("inject_context")
+    graph.add_edge("inject_context", "router")
     graph.add_conditional_edges(
         "router",
         pick_agent,

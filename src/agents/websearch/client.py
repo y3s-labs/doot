@@ -96,7 +96,7 @@ def search_grounded_response(
 
 
 def format_response_with_sources(text: str, sources: list[dict[str, Any]]) -> str:
-    """Append a simple 'Sources:' block to the answer when sources exist."""
+    """Append a 'Sources:' block with Markdown links so they render clickable (e.g. in Rich)."""
     if not sources:
         return text
     lines = [text]
@@ -104,6 +104,10 @@ def format_response_with_sources(text: str, sources: list[dict[str, Any]]) -> st
     lines.append("Sources:")
     for i, s in enumerate(sources, 1):
         title = s.get("title") or "Link"
-        uri = s.get("uri") or ""
-        lines.append(f"  [{i}] {title}: {uri}")
+        uri = (s.get("uri") or "").strip()
+        # Markdown link so terminals/IDEs can make it clickable; avoids long URL wrapping
+        if uri:
+            lines.append(f"  [{i}] [{title}]({uri})")
+        else:
+            lines.append(f"  [{i}] {title}")
     return "\n".join(lines)

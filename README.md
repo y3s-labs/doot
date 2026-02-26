@@ -38,6 +38,14 @@
 
    In a dev container, set `DOOT_AUTH_PASTE_URL=1` and paste the redirect URL when prompted.
 
+4. **Customize the bot (optional)**
+
+   Create an `agent_context/` folder in the project root and add `agent_context/agent_context.md`. That file defines the global context given to every agent (Gmail, Calendar, Web Search, direct)—e.g. who you are, your portfolio, tone, and responsibilities.
+
+   - Put any intro or notes at the top; the text **after** the first `---` line is what the bot uses as context.
+   - The `agent_context/` folder is in `.gitignore`, so your custom context is not committed.
+   - If the file or folder is missing, the bot still runs with no custom context.
+
 ## Usage
 
 - **One-shot**
@@ -106,6 +114,7 @@
 ## Project layout
 
 ```
+agent_context/        # (optional, gitignored) agent_context.md = global context for all agents
 src/
   cli.py              # Entrypoint: auth, chat, start (--background), stop, webhook, watch-gmail, version
   webhook.py          # FastAPI: POST /webhook/gmail, POST /webhook/telegram; Gmail push + Telegram bot
