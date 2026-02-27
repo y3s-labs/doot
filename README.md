@@ -12,6 +12,7 @@
 - **Telegram bot** — Chat with the same orchestrator from Telegram; shares the global session with the CLI.
 - **OpenClaw-style memory** — One shared memory store: `MEMORY.md` (long-term facts and preferences) and `memory/YYYY-MM-DD.md` (daily logs). Loaded at session start; the main (direct) agent has tools to read and write memory (`memory_get`, `memory_search`, `memory_append`). Optional per-agent memory (identity, skills, failures, working) for Gmail and Calendar agents.
 - **OpenClaw-style heartbeat** — When the webhook server runs, every 30 minutes the orchestrator runs a checklist from `.doot/HEARTBEAT.md` (email, calendar, etc.). If nothing needs attention the agent replies `HEARTBEAT_OK` and you get no notification; otherwise the summary is sent to Telegram. See [docs/heartbeat.md](docs/heartbeat.md).
+- **Scheduled tasks** — On each heartbeat the server checks the current time and kicks off any due tasks from `.doot/schedule.json` (e.g. daily report at 7am). The **report** task compiles weather and police info via web search and sends the report by email (Gmail API) and saves it to `.doot/reports/YYYY-MM-DD.md`. You can add more tasks at different times. See [docs/scheduled-tasks.md](docs/scheduled-tasks.md).
 
 ## Setup
 
@@ -30,7 +31,7 @@
    - `ANTHROPIC_API_KEY` — for the orchestrator and Gmail/Calendar agents.
    - `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) — for the web search agent (Gemini + Google Search grounding). Get a key from [Google AI Studio](https://aistudio.google.com/apikey).
 
-   Optional: `DOOT_TOKENS_PATH`, `DOOT_SESSION_PATH` (default: `.doot/chat_session.json` in project), `DOOT_MEMORY_DIR` (default: `.doot/` for OpenClaw-style memory files), `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`. For Telegram: `TELEGRAM_BOT_TOKEN` (required for the bot), `TELEGRAM_WEBHOOK_BASE_URL` (e.g. `https://yourdomain.com`) to auto-register the webhook when the server starts. For heartbeat: `DOOT_HEARTBEAT_INTERVAL_SEC` (default 1800; set to 0 to disable).
+   Optional: `DOOT_TOKENS_PATH`, `DOOT_SESSION_PATH` (default: `.doot/chat_session.json` in project), `DOOT_MEMORY_DIR` (default: `.doot/` for OpenClaw-style memory files), `DOOT_AUTH_PORT`, `DOOT_AUTH_PASTE_URL=1` (for dev containers), `USER_EMAIL`. For Telegram: `TELEGRAM_BOT_TOKEN` (required for the bot), `TELEGRAM_WEBHOOK_BASE_URL` (e.g. `https://yourdomain.com`) to auto-register the webhook when the server starts. For heartbeat: `DOOT_HEARTBEAT_INTERVAL_SEC` (default 1800; set to 0 to disable). For scheduled tasks: `DOOT_SCHEDULE_TZ` (e.g. `America/New_York`), `DOOT_SCHEDULE_PATH`, `DOOT_REPORT_TO_EMAIL` (default `USER_EMAIL`), `DOOT_REPORT_LOCATION`, `DOOT_REPORT_PROMPT_PATH`.
 
 3. **Authenticate**
 
@@ -65,7 +66,11 @@
 
 6. **Heartbeat (optional)**
 
-   When the webhook server is running (`doot start`, `doot webhook`, or `doot start --background`), a heartbeat runs every 30 minutes (override with `DOOT_HEARTBEAT_INTERVAL_SEC`). Each run: the orchestrator gets one turn with a checklist. The checklist is read from **`.doot/HEARTBEAT.md`** (or `{DOOT_MEMORY_DIR}/HEARTBEAT.md`). If the agent finds nothing needing your attention, it replies with `HEARTBEAT_OK` and no message is sent to Telegram; otherwise its summary is sent to your Telegram chat. So you only get notified when something needs attention. Customize the checklist by editing `.doot/HEARTBEAT.md`; see [docs/heartbeat.md](docs/heartbeat.md) for an example. Set `DOOT_HEARTBEAT_INTERVAL_SEC=0` to disable the heartbeat.
+   When the webhook server is running (`doot start`, `doot webhook`, or `doot start --background`), a heartbeat runs every 30 minutes (override with `DOOT_HEARTBEAT_INTERVAL_SEC`). Each run: the orchestrator gets one turn with a checklist. The checklist is read from **`.doot/HEARTBEAT.md`** (or `{DOOT_MEMORY_DIR}/HEARTBEAT.md`). If the agent finds nothing needing your attention, it replies with `HEARTBEAT_OK` and no message is sent to Telegram; otherwise its summary is sent to your Telegram chat. So you only get notified when something needs attention. Customize the checklist by editing `.doot/HEARTBEAT.md`; see [docs/heartbeat.md](docs/heartbeat.md) for an example.    Set `DOOT_HEARTBEAT_INTERVAL_SEC=0` to disable the heartbeat.
+
+7. **Scheduled tasks (optional)**
+
+   When the webhook server is running, on each heartbeat it checks the current time (in `DOOT_SCHEDULE_TZ`, default `America/New_York`). If any task in **`.doot/schedule.json`** is due (scheduled time passed today and not yet run today), it kicks off that task in the background. The built-in **report** task loads the prompt from `.doot/REPORT_PROMPT.md`, runs the orchestrator (multi-step web search, etc.), saves the result to `.doot/reports/YYYY-MM-DD.md`, and sends it by email (Gmail API). Set `DOOT_REPORT_TO_EMAIL` or use `USER_EMAIL` as the recipient. See [docs/scheduled-tasks.md](docs/scheduled-tasks.md).
 
 ## Usage
 
@@ -134,6 +139,7 @@
 - **[docs/telegram-setup.md](docs/telegram-setup.md)** — Step-by-step: create a Telegram bot, set `TELEGRAM_BOT_TOKEN`, webhook vs polling, and chat with Doot from Telegram (shared global session with CLI).
 - **[docs/setup-gmail-pubsub.md](docs/setup-gmail-pubsub.md)** — Step-by-step: auth, webhook, ngrok, Pub/Sub topic & push subscription, `watch-gmail`, and how to verify new-email webhooks are working.
 - **[docs/heartbeat.md](docs/heartbeat.md)** — OpenClaw-style heartbeat: HEARTBEAT.md checklist, HEARTBEAT_OK behavior, and example checklist.
+- **[docs/scheduled-tasks.md](docs/scheduled-tasks.md)** — Scheduled tasks: schedule file, daily report at 7am, email delivery, and adding more tasks.
 
 ## Project layout
 

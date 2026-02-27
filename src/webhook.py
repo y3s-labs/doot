@@ -7,7 +7,9 @@ import logging
 import os
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -27,6 +29,16 @@ HEARTBEAT_OK = "HEARTBEAT_OK"
 _DEFAULT_HEARTBEAT_CHECKLIST = (
     "Check email and calendar for anything needing attention. "
     "If nothing requires the user's attention, reply with exactly HEARTBEAT_OK."
+)
+
+# Schedule: timezone and path for scheduled tasks (e.g. daily report at 7am)
+DOOT_SCHEDULE_TZ = os.getenv("DOOT_SCHEDULE_TZ", "America/New_York")
+DOOT_SCHEDULE_PATH_ENV = os.getenv("DOOT_SCHEDULE_PATH")
+
+# Report prompt default when REPORT_PROMPT.md is missing
+_DEFAULT_REPORT_PROMPT = (
+    "Search the web for current weather in {location} and recent police or public safety activity or incidents in {location}. "
+    "Compile a brief daily report with dates and sources. Use a neutral tone."
 )
 
 
@@ -73,6 +85,186 @@ def _load_heartbeat_checklist() -> str:
         except OSError as e:
             log.warning("Could not read HEARTBEAT.md at %s: %s", path, e)
     return _DEFAULT_HEARTBEAT_CHECKLIST
+
+
+def _schedule_path() -> Path:
+    """Path for schedule file (JSON or markdown)."""
+    if DOOT_SCHEDULE_PATH_ENV:
+        return Path(DOOT_SCHEDULE_PATH_ENV).expanduser()
+    return get_memory_root() / "schedule.json"
+
+
+def _last_run_path() -> Path:
+    """Path for last-run state (task_id -> date string)."""
+    return get_memory_root() / "schedule_last_run.json"
+
+
+def _load_schedule() -> list[dict]:
+    """Load schedule: list of {time, task_id, recurrence, delivery}. Returns [] if missing or invalid."""
+    path = _schedule_path()
+    if not path.exists():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if path.suffix.lower() == ".json":
+            data = json.loads(raw)
+            return data if isinstance(data, list) else []
+        # SCHEDULE.md: lines like "07:00 report daily email"
+        lines = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 4:
+                lines.append({
+                    "time": parts[0],
+                    "task_id": parts[1],
+                    "recurrence": parts[2],
+                    "delivery": parts[3],
+                })
+        return lines
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning("Could not load schedule from %s: %s", path, e)
+        return []
+
+
+def _load_last_run() -> dict[str, str]:
+    """Load last-run state: {task_id: "YYYY-MM-DD"}."""
+    path = _last_run_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_last_run(task_id: str, date_str: str) -> None:
+    """Record that task_id was run on date_str."""
+    path = _last_run_path()
+    state = _load_last_run()
+    state[task_id] = date_str
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _get_due_tasks() -> list[dict]:
+    """Return list of schedule entries that are due (scheduled time passed today and not yet run today)."""
+    tz = ZoneInfo(DOOT_SCHEDULE_TZ)
+    now = datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    last_run = _load_last_run()
+    schedule = _load_schedule()
+    due = []
+    for entry in schedule:
+        task_id = entry.get("task_id")
+        if not task_id:
+            continue
+        if last_run.get(task_id) == today:
+            continue
+        time_str = entry.get("time") or "00:00"
+        try:
+            hour, minute = map(int, time_str.split(":")[:2])
+        except (ValueError, AttributeError):
+            continue
+        # scheduled time today in same TZ
+        scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if now >= scheduled:
+            due.append(entry)
+    return due
+
+
+def _report_prompt_path() -> Path:
+    """Path for REPORT_PROMPT.md."""
+    path_env = os.getenv("DOOT_REPORT_PROMPT_PATH")
+    if path_env:
+        return Path(path_env).expanduser()
+    return get_memory_root() / "REPORT_PROMPT.md"
+
+
+def _load_report_prompt() -> str:
+    """Load report prompt from REPORT_PROMPT.md or return default with location placeholder filled."""
+    path = _report_prompt_path()
+    location = os.getenv("DOOT_REPORT_LOCATION", "Providence, RI")
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8").strip().replace("[location]", location).replace("{location}", location)
+        except OSError as e:
+            log.warning("Could not read REPORT_PROMPT.md at %s: %s", path, e)
+    return _DEFAULT_REPORT_PROMPT.format(location=location)
+
+
+def _run_report_turn() -> str | None:
+    """
+    Run one report turn: load report prompt, invoke orchestrator (no session), return last_ai_text or None.
+    Called from async via asyncio.to_thread.
+    """
+    from langchain_core.messages import HumanMessage
+
+    from src.orchestrator_runner import invoke_orchestrator
+
+    prompt = _load_report_prompt()
+    try:
+        result, last_ai_text = invoke_orchestrator([HumanMessage(content=prompt)])
+        return last_ai_text or None
+    except Exception as e:
+        log.exception("Report turn failed: %s", e)
+        return None
+
+
+def _run_scheduled_task_sync(task_id: str, delivery: str) -> str | None:
+    """Run the scheduled task (e.g. report) and return result text for delivery. Returns None on failure."""
+    if task_id != "report":
+        log.warning("Unknown scheduled task_id=%s", task_id)
+        return None
+    return _run_report_turn()
+
+
+async def _run_scheduled_task_async(entry: dict) -> None:
+    """Run a due scheduled task in the background: run turn, save report file, send email, update last-run."""
+    task_id = entry.get("task_id", "")
+    delivery = entry.get("delivery", "email")
+    tz = ZoneInfo(DOOT_SCHEDULE_TZ)
+    today = datetime.now(tz).strftime("%Y-%m-%d")
+    try:
+        result_text = await asyncio.to_thread(_run_scheduled_task_sync, task_id, delivery)
+        if result_text is None or not result_text.strip():
+            log.warning("Scheduled task %s produced no output", task_id)
+            return
+        # Save to .doot/reports/YYYY-MM-DD.md
+        reports_dir = get_memory_root() / "reports"
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        report_file = reports_dir / f"{today}.md"
+        report_file.write_text(result_text.strip(), encoding="utf-8")
+        log.info("Report saved to %s", report_file)
+        # Send email
+        to_email = os.getenv("DOOT_REPORT_TO_EMAIL") or os.getenv("USER_EMAIL")
+        if to_email and delivery == "email":
+            try:
+                from src.agents.gmail.client import send_message
+                send_message(
+                    to_email=to_email.strip(),
+                    subject=f"Doot daily report – {today}",
+                    body=result_text.strip(),
+                )
+                log.info("Report email sent to %s", to_email)
+            except Exception as e:
+                log.exception("Failed to send report email: %s", e)
+        # Optional Telegram summary
+        chat_id = _get_gmail_push_chat_id()
+        if chat_id:
+            try:
+                _send_telegram_text(
+                    chat_id,
+                    f"Daily report sent to your email and saved to .doot/reports/{today}.md.",
+                )
+            except Exception as e:
+                log.warning("Failed to send report summary to Telegram: %s", e)
+        _save_last_run(task_id, today)
+    except Exception as e:
+        log.exception("Scheduled task %s failed: %s", task_id, e)
 
 
 def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegram: bool = False) -> None:
@@ -182,29 +374,35 @@ def _is_heartbeat_ok(last_ai_text: str) -> bool:
 
 
 async def _heartbeat_loop() -> None:
-    """Every HEARTBEAT_INTERVAL_SEC, run orchestrator with HEARTBEAT.md checklist; notify only if not HEARTBEAT_OK."""
+    """Every HEARTBEAT_INTERVAL_SEC, run HEARTBEAT.md checklist; then check schedule and kick off any due tasks."""
     while True:
         await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        # Run normal heartbeat (email/calendar checklist)
         result = await asyncio.to_thread(_run_heartbeat_turn)
-        if result is None:
-            continue
-        last_ai_text, _route = result
-        last_ai_text = (last_ai_text or "").strip()
-        if _is_heartbeat_ok(last_ai_text):
-            log.info("Heartbeat (nothing to report)")
-            continue
-        chat_id = _get_gmail_push_chat_id()
-        if chat_id:
-            try:
-                formatted = format_orchestrator_reply_for_telegram(last_ai_text)
-                _send_telegram_text(chat_id, formatted, already_formatted_for_telegram=True)
-                log.info("Heartbeat reported something, sent to Telegram chat_id=%s", chat_id)
-            except Exception as e:
-                log.warning("Heartbeat Telegram send failed: %s", e)
-                try:
-                    _send_telegram_text(chat_id, last_ai_text)
-                except Exception:
-                    pass
+        if result is not None:
+            last_ai_text, _route = result
+            last_ai_text = (last_ai_text or "").strip()
+            if not _is_heartbeat_ok(last_ai_text):
+                chat_id = _get_gmail_push_chat_id()
+                if chat_id:
+                    try:
+                        formatted = format_orchestrator_reply_for_telegram(last_ai_text)
+                        _send_telegram_text(chat_id, formatted, already_formatted_for_telegram=True)
+                        log.info("Heartbeat reported something, sent to Telegram chat_id=%s", chat_id)
+                    except Exception as e:
+                        log.warning("Heartbeat Telegram send failed: %s", e)
+                        try:
+                            _send_telegram_text(chat_id, last_ai_text)
+                        except Exception:
+                            pass
+            else:
+                log.info("Heartbeat (nothing to report)")
+        # Check current time and kick off any due scheduled tasks (e.g. daily report at 7am)
+        for entry in _get_due_tasks():
+            task_id = entry.get("task_id")
+            if task_id:
+                log.info("Kicking off scheduled task: %s", task_id)
+                asyncio.create_task(_run_scheduled_task_async(entry))
 
 
 @app.on_event("startup")

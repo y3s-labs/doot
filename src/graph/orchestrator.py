@@ -1,4 +1,4 @@
-"""Orchestrator: routes user messages to the right agent."""
+"""Orchestrator: plans and runs multi-step tasks by calling agents (gmail, calendar, websearch, direct) with different queries until done."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from typing import TypedDict
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import create_react_agent
 
@@ -21,6 +22,27 @@ from src.memory.claw_store import load_memory_for_context
 from src.memory.claw_tools import CLAW_MEMORY_TOOLS
 
 log = logging.getLogger("doot.orchestrator")
+
+
+def _extract_last_ai_text(messages: list) -> str:
+    """Extract text from the last AIMessage. Returns empty string if none."""
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage) and msg.content:
+            content = msg.content
+            if isinstance(content, list):
+                text_blocks = [
+                    block.get("text")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
+                ]
+                return "\n".join(text_blocks) if text_blocks else ""
+            return content if isinstance(content, str) else str(content)
+    return ""
+
+
+def _agent_messages(query: str) -> list[BaseMessage]:
+    """Build message list with global context + single user query for agent invocation."""
+    return [_global_context_message(), HumanMessage(content=query)]
 
 # Shared per-agent memory service (identity, skills, failures, working)
 _memory_service = AgentMemoryService()
@@ -60,30 +82,9 @@ def _anthropic_api_key() -> str | None:
     return (raw.strip() if raw else None) or None
 
 
-ROUTER_SYSTEM = SystemMessage(
-    content=(
-        "You are a routing assistant. Given the user's message, decide which agent should handle it.\n"
-        "Available agents:\n"
-        "  - gmail: anything about emails, inbox, messages, mail\n"
-        "  - calendar: anything about calendar, events, meetings, schedule, appointments\n"
-        "  - websearch: look up current info, search the web, recent events, facts, \"what is\", \"who won\", news\n"
-        "  - none: if you can answer directly without any agent\n\n"
-        "Respond with ONLY the agent name (gmail, calendar, websearch, or none) and nothing else."
-    )
-)
-
-
 class OrchestratorState(TypedDict):
     messages: list[BaseMessage]
     route: str
-
-
-def _build_router_llm():
-    return ChatAnthropic(
-        model="claude-sonnet-4-20250514",
-        anthropic_api_key=_anthropic_api_key(),
-        max_tokens=50,
-    )
 
 
 def inject_global_context(state: OrchestratorState) -> OrchestratorState:
@@ -91,61 +92,6 @@ def inject_global_context(state: OrchestratorState) -> OrchestratorState:
     messages = list(state["messages"])
     # Always prepend so that OpenClaw memory (MEMORY.md + today/yesterday) is fresh each turn
     return {**state, "messages": [_global_context_message()] + messages}
-
-
-def route_node(state: OrchestratorState) -> OrchestratorState:
-    """Classify the user's message and pick an agent."""
-    log.info("Router: classifying message...")
-    llm = _build_router_llm()
-    last_user_msg = None
-    for msg in reversed(state["messages"]):
-        if isinstance(msg, HumanMessage):
-            last_user_msg = msg
-            break
-    if not last_user_msg:
-        log.info("Router: no user message found, defaulting to 'none'")
-        return {**state, "route": "none"}
-    response = llm.invoke([ROUTER_SYSTEM, last_user_msg])
-    raw_route = response.content.strip().lower() if isinstance(response.content, str) else str(response.content)
-    if "gmail" in raw_route:
-        route = "gmail"
-    elif "calendar" in raw_route:
-        route = "calendar"
-    elif "websearch" in raw_route or "web_search" in raw_route:
-        route = "websearch"
-    else:
-        route = "none"
-    log.info("Router: raw=%r → route=%s", raw_route, route)
-    return {**state, "route": route}
-
-
-def gmail_node(state: OrchestratorState) -> OrchestratorState:
-    """Run the Gmail agent on the user's messages."""
-    log.info("Gmail agent: running...")
-    agent = create_gmail_agent(task_id=_MEMORY_TASK_ID, memory_service=_memory_service)
-    result = agent.invoke({"messages": state["messages"]})
-    log.info("Gmail agent: done, %d messages in result", len(result["messages"]))
-    save_agent_memory(_memory_service, "gmail", _MEMORY_TASK_ID, result)
-    return {**state, "messages": result["messages"]}
-
-
-def calendar_node(state: OrchestratorState) -> OrchestratorState:
-    """Run the Calendar agent on the user's messages."""
-    log.info("Calendar agent: running...")
-    agent = create_calendar_agent(task_id=_MEMORY_TASK_ID, memory_service=_memory_service)
-    result = agent.invoke({"messages": state["messages"]})
-    log.info("Calendar agent: done, %d messages in result", len(result["messages"]))
-    save_agent_memory(_memory_service, "calendar", _MEMORY_TASK_ID, result)
-    return {**state, "messages": result["messages"]}
-
-
-def websearch_node(state: OrchestratorState) -> OrchestratorState:
-    """Run the Web Search (Gemini grounding) agent on the user's messages."""
-    log.info("Web search agent: running...")
-    agent = create_websearch_agent()
-    result = agent.invoke({"messages": state["messages"]})
-    log.info("Web search agent: done, %d messages in result", len(result["messages"]))
-    return {**state, "messages": result["messages"]}
 
 
 def _direct_system_message() -> SystemMessage:
@@ -177,41 +123,89 @@ def _build_direct_agent():
     )
 
 
-def direct_node(state: OrchestratorState) -> OrchestratorState:
-    """Answer directly using a ReAct agent with memory tools (read/write MEMORY.md and daily logs)."""
-    log.info("Direct node: running with memory tools...")
+# --- Agent tools for multi-step ReAct orchestrator (plan then call agents with different queries) ---
+
+@tool
+def websearch(query: str) -> str:
+    """Search the web for current information. Use for weather, news, police activity, or any up-to-date facts. Pass a clear search query (e.g. 'current weather Providence RI' or 'recent police activity Providence RI')."""
+    agent = create_websearch_agent()
+    messages = _agent_messages(query)
+    result = agent.invoke({"messages": messages})
+    return _extract_last_ai_text(result.get("messages", []))
+
+
+@tool
+def gmail(instruction: str) -> str:
+    """Use Gmail: list inbox, search emails, read an email, or move to trash. Pass a clear instruction (e.g. 'list my last 5 emails' or 'search for emails from X')."""
+    agent = create_gmail_agent(task_id=_MEMORY_TASK_ID, memory_service=_memory_service)
+    messages = _agent_messages(instruction)
+    result = agent.invoke({"messages": messages})
+    save_agent_memory(_memory_service, "gmail", _MEMORY_TASK_ID, result)
+    return _extract_last_ai_text(result.get("messages", []))
+
+
+@tool
+def calendar(instruction: str) -> str:
+    """Use Google Calendar: list upcoming events, view details, create or delete events. Pass a clear instruction (e.g. 'list events in the next 2 hours')."""
+    agent = create_calendar_agent(task_id=_MEMORY_TASK_ID, memory_service=_memory_service)
+    messages = _agent_messages(instruction)
+    result = agent.invoke({"messages": messages})
+    save_agent_memory(_memory_service, "calendar", _MEMORY_TASK_ID, result)
+    return _extract_last_ai_text(result.get("messages", []))
+
+
+@tool
+def direct(instruction: str) -> str:
+    """Answer using memory (MEMORY.md and daily logs). Use for facts the user has stored, or to read/append memory. Pass a short instruction or question."""
     agent = _build_direct_agent()
+    messages = _agent_messages(instruction)
+    result = agent.invoke({"messages": messages})
+    return _extract_last_ai_text(result.get("messages", []))
+
+
+ORCHESTRATOR_AGENT_TOOLS = [websearch, gmail, calendar, direct]
+
+REACT_SYSTEM = SystemMessage(
+    content=(
+        "You are an assistant that completes tasks by using tools. You have: websearch(query), gmail(instruction), calendar(instruction), direct(instruction). "
+        "Use them as needed. For multi-step tasks (e.g. compile a report on weather and police activity), call websearch multiple times with different search queries, "
+        "then synthesize the results into a final answer. When you have enough information, provide the complete response to the user. Be concise and accurate."
+    )
+)
+
+
+def _build_react_orchestrator_agent():
+    """ReAct agent that can call gmail, calendar, websearch, direct multiple times until task is complete."""
+    llm = ChatAnthropic(
+        model="claude-sonnet-4-20250514",
+        anthropic_api_key=_anthropic_api_key(),
+        max_tokens=4096,
+    )
+    return create_react_agent(
+        llm,
+        tools=ORCHESTRATOR_AGENT_TOOLS,
+        prompt=REACT_SYSTEM,
+    )
+
+
+def react_orchestrator_node(state: OrchestratorState) -> OrchestratorState:
+    """Run the ReAct orchestrator (plan and multi-step agent calls) on the current messages."""
+    log.info("ReAct orchestrator: running (multi-step)...")
+    agent = _build_react_orchestrator_agent()
     result = agent.invoke({"messages": state["messages"]})
-    log.info("Direct node: done, %d messages in result", len(result["messages"]))
+    log.info("ReAct orchestrator: done, %d messages in result", len(result["messages"]))
     return {**state, "messages": result["messages"]}
 
 
-def pick_agent(state: OrchestratorState) -> str:
-    """Conditional edge: route to the chosen agent node."""
-    return state["route"]
-
-
 def build_orchestrator() -> StateGraph:
-    """Build and compile the orchestrator graph."""
+    """Build and compile the orchestrator graph. Uses ReAct agent with agent-tools for planning and multi-step execution (multiple websearch/gmail/calendar/direct calls until task complete)."""
     graph = StateGraph(OrchestratorState)
 
     graph.add_node("inject_context", inject_global_context)
-    graph.add_node("router", route_node)
-    graph.add_node("gmail", gmail_node)
-    graph.add_node("calendar", calendar_node)
-    graph.add_node("websearch", websearch_node)
-    graph.add_node("direct", direct_node)
+    graph.add_node("react_orchestrator", react_orchestrator_node)
 
     graph.set_entry_point("inject_context")
-    graph.add_edge("inject_context", "router")
-    graph.add_conditional_edges(
-        "router",
-        pick_agent,
-        {"gmail": "gmail", "calendar": "calendar", "websearch": "websearch", "none": "direct"},
-    )
-    graph.add_edge("gmail", END)
-    graph.add_edge("calendar", END)
-    graph.add_edge("websearch", END)
-    graph.add_edge("direct", END)
+    graph.add_edge("inject_context", "react_orchestrator")
+    graph.add_edge("react_orchestrator", END)
 
     return graph.compile()
