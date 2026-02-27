@@ -12,10 +12,22 @@ from pathlib import Path
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from src.memory.claw_store import get_memory_root
 from src.session import load_session, save_session, session_path
 from src.utils.telegram_format import format_orchestrator_reply_for_telegram
 
 log = logging.getLogger("doot.webhook")
+
+# Heartbeat interval in seconds (default 30 minutes); override with DOOT_HEARTBEAT_INTERVAL_SEC
+HEARTBEAT_INTERVAL_SEC = int(os.getenv("DOOT_HEARTBEAT_INTERVAL_SEC", str(30 * 60)))
+# Sentinel: if the agent replies with this (or starts with it), we do not send to Telegram
+HEARTBEAT_OK = "HEARTBEAT_OK"
+
+# Default checklist when HEARTBEAT.md is missing
+_DEFAULT_HEARTBEAT_CHECKLIST = (
+    "Check email and calendar for anything needing attention. "
+    "If nothing requires the user's attention, reply with exactly HEARTBEAT_OK."
+)
 
 
 # File to store last Telegram chat_id so Gmail push summaries can be sent to the same chat
@@ -45,6 +57,22 @@ def _set_last_telegram_chat_id(chat_id: int) -> None:
     path = _telegram_chat_id_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(chat_id))
+
+
+def _heartbeat_md_path() -> Path:
+    """Path for HEARTBEAT.md (same root as MEMORY.md and session)."""
+    return get_memory_root() / "HEARTBEAT.md"
+
+
+def _load_heartbeat_checklist() -> str:
+    """Load checklist from HEARTBEAT.md or return default."""
+    path = _heartbeat_md_path()
+    if path.exists():
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError as e:
+            log.warning("Could not read HEARTBEAT.md at %s: %s", path, e)
+    return _DEFAULT_HEARTBEAT_CHECKLIST
 
 
 def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegram: bool = False) -> None:
@@ -113,10 +141,79 @@ def _check_anthropic_key() -> None:
         log.info("ANTHROPIC_API_KEY loaded (prefix %r, length %d)", prefix, len(key))
 
 
+def _run_heartbeat_turn() -> tuple[str, str] | None:
+    """
+    Run one heartbeat turn: load session, append heartbeat message (instruction + checklist),
+    invoke orchestrator, save session. Returns (last_ai_text, route) or None on failure.
+    Called from async loop via asyncio.to_thread so it does not block the event loop.
+    """
+    from langchain_core.messages import HumanMessage
+
+    from src.orchestrator_runner import invoke_orchestrator
+
+    checklist = _load_heartbeat_checklist()
+    instruction = (
+        "This is a scheduled heartbeat. Follow the checklist below. "
+        "Use your tools (Gmail, Calendar, memory) as needed. "
+        "If nothing requires the user's attention, reply with exactly HEARTBEAT_OK and nothing else. "
+        "Otherwise briefly summarize what needs attention.\n\n"
+    )
+    body = instruction + checklist
+    try:
+        messages = load_session()
+        messages.append(HumanMessage(content=body))
+        result, last_ai_text = invoke_orchestrator(messages)
+        save_session(result.get("messages", []))
+        route = result.get("route", "?")
+        log.info("Heartbeat turn completed, route=%s", route)
+        return (last_ai_text or "", route)
+    except Exception as e:
+        log.exception("Heartbeat turn failed: %s", e)
+        return None
+
+
+def _is_heartbeat_ok(last_ai_text: str) -> bool:
+    """True if the reply indicates nothing to report (do not send to Telegram)."""
+    t = last_ai_text.strip()
+    if not t:
+        return True
+    upper = t.upper()
+    return upper == HEARTBEAT_OK or upper.startswith(HEARTBEAT_OK)
+
+
+async def _heartbeat_loop() -> None:
+    """Every HEARTBEAT_INTERVAL_SEC, run orchestrator with HEARTBEAT.md checklist; notify only if not HEARTBEAT_OK."""
+    while True:
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SEC)
+        result = await asyncio.to_thread(_run_heartbeat_turn)
+        if result is None:
+            continue
+        last_ai_text, _route = result
+        last_ai_text = (last_ai_text or "").strip()
+        if _is_heartbeat_ok(last_ai_text):
+            log.info("Heartbeat (nothing to report)")
+            continue
+        chat_id = _get_gmail_push_chat_id()
+        if chat_id:
+            try:
+                formatted = format_orchestrator_reply_for_telegram(last_ai_text)
+                _send_telegram_text(chat_id, formatted, already_formatted_for_telegram=True)
+                log.info("Heartbeat reported something, sent to Telegram chat_id=%s", chat_id)
+            except Exception as e:
+                log.warning("Heartbeat Telegram send failed: %s", e)
+                try:
+                    _send_telegram_text(chat_id, last_ai_text)
+                except Exception:
+                    pass
+
+
 @app.on_event("startup")
-def _startup() -> None:
+async def _startup() -> None:
     _check_anthropic_key()
     _register_telegram_webhook()
+    if HEARTBEAT_INTERVAL_SEC > 0:
+        asyncio.create_task(_heartbeat_loop())
+        log.info("Heartbeat enabled every %s seconds", HEARTBEAT_INTERVAL_SEC)
 
 
 def on_gmail_push(payload: dict) -> None:
