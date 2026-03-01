@@ -267,6 +267,22 @@ async def _run_scheduled_task_async(entry: dict) -> None:
         log.exception("Scheduled task %s failed: %s", task_id, e)
 
 
+def _send_telegram_typing(chat_id: int) -> None:
+    """Send the typing chat action to a Telegram chat (shows \"typing...\" for ~5 seconds)."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        return
+    async def _send() -> None:
+        from telegram import Bot
+        from telegram.constants import ChatAction
+        bot = Bot(token=token)
+        await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        asyncio.run(_send())
+    except Exception as e:
+        log.debug("Telegram typing action failed: %s", e)
+
+
 def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegram: bool = False) -> None:
     """
     Send a text message to a Telegram chat.
@@ -517,26 +533,45 @@ def process_telegram_message(chat_id: int, text: str) -> None:
     """
     Load global session, append user message, invoke orchestrator, save session, send reply to Telegram.
     Used by both webhook and polling. Sends a short error message to the user on failure.
+    Shows typing indicator while processing (repeated every 4s until reply is sent).
     """
+    import threading
+
     from langchain_core.messages import HumanMessage
 
     from src.orchestrator_runner import invoke_orchestrator
 
-    try:
-        messages = load_session()
-        messages.append(HumanMessage(content=text))
-        result, last_ai_text = invoke_orchestrator(messages)
-        save_session(result.get("messages", []))
+    stop_typing = threading.Event()
 
-        reply = (last_ai_text or "No reply generated.").strip()
+    def _typing_loop() -> None:
+        _send_telegram_typing(chat_id)
+        while not stop_typing.wait(timeout=4):
+            _send_telegram_typing(chat_id)
+
+    try:
+        _send_telegram_typing(chat_id)
+        typing_thread = threading.Thread(target=_typing_loop, daemon=True)
+        typing_thread.start()
+
         try:
-            reply = format_orchestrator_reply_for_telegram(reply)
-            _send_telegram_text(chat_id, reply, already_formatted_for_telegram=True)
-        except Exception as fmt_err:
-            log.warning("Telegram formatting failed, sending plain: %s", fmt_err)
-            _send_telegram_text(chat_id, (last_ai_text or "No reply generated.").strip())
+            messages = load_session()
+            messages.append(HumanMessage(content=text))
+            result, last_ai_text = invoke_orchestrator(messages)
+            save_session(result.get("messages", []))
+
+            reply = (last_ai_text or "No reply generated.").strip()
+            try:
+                reply = format_orchestrator_reply_for_telegram(reply)
+                _send_telegram_text(chat_id, reply, already_formatted_for_telegram=True)
+            except Exception as fmt_err:
+                log.warning("Telegram formatting failed, sending plain: %s", fmt_err)
+                _send_telegram_text(chat_id, (last_ai_text or "No reply generated.").strip())
+        finally:
+            stop_typing.set()
+            typing_thread.join(timeout=5)
     except Exception as e:
         log.exception("Telegram message failed: %s", e)
+        stop_typing.set()
         try:
             _send_telegram_text(chat_id, "Something went wrong. Please try again later.")
         except Exception as send_err:
