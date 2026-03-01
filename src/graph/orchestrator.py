@@ -6,6 +6,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import TypedDict
 
 from langchain_anthropic import ChatAnthropic
@@ -67,11 +68,37 @@ def _load_agent_context() -> str:
     return raw
 
 
+def _primary_tz() -> ZoneInfo:
+    """Primary timezone for the user (e.g. America/New_York). Used for 'what time is it?' and scheduling."""
+    tz_name = os.getenv("DOOT_SCHEDULE_TZ", "America/New_York").strip()
+    return ZoneInfo(tz_name)
+
+
+def _current_datetime_context() -> str:
+    """Current date/time so the main orchestrator can answer 'what is today?' or 'what time is it?'."""
+    now_utc = datetime.now(timezone.utc)
+    now_local = now_utc.astimezone(_primary_tz())
+    tz_name = os.getenv("DOOT_SCHEDULE_TZ", "America/New_York").strip()
+
+    today_iso = now_local.strftime("%Y-%m-%d")
+    today_readable = now_local.strftime("%A, %B %d, %Y")
+    time_utc = now_utc.strftime("%H:%M UTC")
+    time_local = now_local.strftime("%H:%M %Z")
+
+    return (
+        f"Current date and time: {today_readable}. "
+        f"Date in ISO form: {today_iso}. "
+        f"Time in primary timezone ({tz_name}): {time_local}. Time in UTC: {time_utc}. "
+        "Use this when the user asks about today, the current date, or the current time. Prefer the primary timezone when answering."
+    )
+
+
 def _global_context_message() -> SystemMessage:
-    """System message with agent_context.md + OpenClaw-style memory (MEMORY.md + today/yesterday)."""
+    """System message with agent_context.md + current date/time + OpenClaw-style memory (MEMORY.md + today/yesterday)."""
     context = _load_agent_context()
     claw_memory = load_memory_for_context()
     parts = [context] if context else []
+    parts.append(_current_datetime_context())
     parts.append(claw_memory)
     return SystemMessage(content="\n\n".join(parts))
 
@@ -96,17 +123,7 @@ def inject_global_context(state: OrchestratorState) -> OrchestratorState:
 
 def _direct_system_message() -> SystemMessage:
     """System message with current date/time so the model can answer 'what is today?' etc."""
-    now = datetime.now(timezone.utc)
-    today_iso = now.strftime("%Y-%m-%d")
-    today_readable = now.strftime("%A, %B %d, %Y")
-    time_utc = now.strftime("%H:%M UTC")
-    return SystemMessage(
-        content=(
-            f"Current date and time: {today_readable}. "
-            f"Date in ISO form: {today_iso}. Time: {time_utc}. "
-            "Use this when the user asks about today, the current date, or the current time."
-        )
-    )
+    return SystemMessage(content=_current_datetime_context())
 
 
 def _build_direct_agent():
