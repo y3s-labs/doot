@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import os
+from email.mime.text import MIMEText
+
 from googleapiclient.discovery import build
 
 from src.agents.gmail.auth import get_credentials
@@ -62,6 +66,33 @@ def trash_message(user_id: str, msg_id: str) -> dict:
     """Move a message to Trash. Requires gmail.modify scope."""
     service = get_gmail_service()
     return service.users().messages().trash(userId=user_id, id=msg_id).execute()
+
+
+def send_message(
+    *,
+    user_id: str = "me",
+    to_email: str,
+    subject: str,
+    body: str,
+    from_email: str | None = None,
+) -> dict:
+    """
+    Send an email. Uses gmail.modify (or gmail.send) scope.
+    from_email defaults to the authenticated user's address (from profile) or USER_EMAIL env.
+    """
+    service = get_gmail_service()
+    if not from_email:
+        from_email = (
+            os.getenv("USER_EMAIL")
+            or service.users().getProfile(userId=user_id).execute().get("emailAddress", "")
+            or "noreply@localhost"
+        )
+    message = MIMEText(body, "plain", "utf-8")
+    message["to"] = to_email
+    message["from"] = from_email
+    message["subject"] = subject
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+    return service.users().messages().send(userId=user_id, body={"raw": raw}).execute()
 
 
 def message_to_summary(msg: dict) -> dict:

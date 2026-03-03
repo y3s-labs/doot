@@ -15,6 +15,7 @@ import uvicorn
 # How long to wait for the redirect callback before suggesting paste flow (e.g. dev container)
 AUTH_CALLBACK_TIMEOUT_SEC = 120
 
+# gmail.modify includes read, compose, send, and delete (used for list, get, trash, send_message)
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/calendar",

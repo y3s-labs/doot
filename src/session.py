@@ -10,12 +10,24 @@ from pathlib import Path
 log = logging.getLogger("doot.session")
 
 
+# Sliding window: only this many messages are sent to the model each turn; full history is still persisted.
+SESSION_SLIDING_WINDOW = 20
+
+
 def session_path() -> Path:
     """Path for persisted chat session (JSON). Defaults to project .doot/ so it survives container rebuilds."""
     explicit = os.getenv("DOOT_SESSION_PATH")
     if explicit:
         return Path(explicit).expanduser()
     return Path.cwd() / ".doot" / "chat_session.json"
+
+
+def trim_messages_to_window(messages: list, max_messages: int | None = None) -> list:
+    """Return the last max_messages (default SESSION_SLIDING_WINDOW). Full history stays in caller for saving."""
+    cap = max_messages if max_messages is not None else SESSION_SLIDING_WINDOW
+    if len(messages) <= cap:
+        return list(messages)
+    return list(messages[-cap:])
 
 
 def load_session() -> list:
@@ -55,7 +67,25 @@ def save_session(messages: list) -> None:
     rows = []
     for msg in messages:
         if isinstance(msg, HumanMessage):
-            rows.append({"role": "human", "content": msg.content if isinstance(msg.content, str) else str(msg.content)})
+            raw = msg.content
+            if isinstance(raw, str):
+                content = raw
+            else:
+                # Multimodal (e.g. text + image): persist text-only plus image count
+                parts = []
+                image_count = 0
+                if isinstance(raw, list):
+                    for block in raw:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                parts.append(block.get("text") or "")
+                            elif block.get("type") == "image_url":
+                                image_count += 1
+                content = "\n".join(p for p in parts if p).strip()
+                if image_count:
+                    content = (content + " " if content else "") + f"[{image_count} image(s)]"
+                content = content or "(no text)"
+            rows.append({"role": "human", "content": content})
         elif isinstance(msg, AIMessage):
             content = msg.content
             if isinstance(content, list):
