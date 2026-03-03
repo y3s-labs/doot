@@ -1,4 +1,4 @@
-"""Webhook server for Gmail Pub/Sub push notifications and Telegram bot."""
+"""Webhook server for Telegram bot and heartbeat (email/calendar checked on schedule)."""
 
 import asyncio
 import base64
@@ -14,8 +14,9 @@ from zoneinfo import ZoneInfo
 from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from src.lifecycle import lifespan
 from src.memory.claw_store import get_memory_root
-from src.session import load_session, save_session, session_path
+from src.session import load_session, save_session, session_path, trim_messages_to_window
 from src.utils.telegram_format import format_orchestrator_reply_for_telegram
 
 log = logging.getLogger("doot.webhook")
@@ -42,13 +43,13 @@ _DEFAULT_REPORT_PROMPT = (
 )
 
 
-# File to store last Telegram chat_id so Gmail push summaries can be sent to the same chat
+# File to store last Telegram chat_id so heartbeat/report summaries can be sent to the same chat
 def _telegram_chat_id_path() -> Path:
     return session_path().parent / "telegram_chat_id.txt"
 
 
-def _get_gmail_push_chat_id() -> int | None:
-    """Chat ID to send Gmail push summaries to: TELEGRAM_CHAT_ID env, or last user who messaged the bot."""
+def _get_telegram_summary_chat_id() -> int | None:
+    """Chat ID to send heartbeat/report summaries to: TELEGRAM_CHAT_ID env, or last user who messaged the bot."""
     env_id = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
     if env_id:
         try:
@@ -65,10 +66,36 @@ def _get_gmail_push_chat_id() -> int | None:
 
 
 def _set_last_telegram_chat_id(chat_id: int) -> None:
-    """Remember chat_id so we can send Gmail push summaries to this chat."""
+    """Remember chat_id so we can send heartbeat/report summaries to this chat."""
     path = _telegram_chat_id_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(chat_id))
+
+
+def _download_telegram_photo(file_id: str) -> bytes | None:
+    """
+    Download photo bytes from Telegram by file_id. Uses getFile then GET file URL.
+    Returns None on failure. Runs synchronously for use in background task.
+    """
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+    if not token:
+        return None
+    try:
+        get_url = f"https://api.telegram.org/bot{token}/getFile?file_id={urllib.parse.quote(file_id)}"
+        with urllib.request.urlopen(get_url, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        ok = data.get("ok")
+        result = data.get("result") or {}
+        file_path = result.get("file_path")
+        if not ok or not file_path:
+            log.warning("Telegram getFile failed or no file_path: %s", data)
+            return None
+        download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+        with urllib.request.urlopen(download_url, timeout=30) as resp:
+            return resp.read()
+    except Exception as e:
+        log.warning("Failed to download Telegram photo: %s", e)
+        return None
 
 
 def _heartbeat_md_path() -> Path:
@@ -253,7 +280,7 @@ async def _run_scheduled_task_async(entry: dict) -> None:
             except Exception as e:
                 log.exception("Failed to send report email: %s", e)
         # Optional Telegram summary
-        chat_id = _get_gmail_push_chat_id()
+        chat_id = _get_telegram_summary_chat_id()
         if chat_id:
             try:
                 _send_telegram_text(
@@ -313,7 +340,7 @@ def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegr
     """
     asyncio.run(_send_telegram_text_async(chat_id, text, already_formatted_for_telegram=already_formatted_for_telegram))
 
-app = FastAPI(title="Doot webhook", version="0.1.0")
+app = FastAPI(title="Doot webhook", version="0.1.0", lifespan=lifespan)
 
 # Telegram message limit
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
@@ -323,7 +350,7 @@ def _register_telegram_webhook() -> None:
     """If TELEGRAM_BOT_TOKEN and a base URL are set, set the bot webhook. Uses TELEGRAM_WEBHOOK_BASE_URL or falls back to WEBHOOK_URL (base only)."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     base_url = (os.getenv("TELEGRAM_WEBHOOK_BASE_URL") or os.getenv("WEBHOOK_URL") or "").strip().rstrip("/")
-    # If WEBHOOK_URL had a path (e.g. .../webhook/gmail), keep only the origin
+    # If WEBHOOK_URL had a path, keep only the origin
     if base_url and "/" in base_url[8:]:  # after https://
         from urllib.parse import urlparse
         parsed = urlparse(base_url)
@@ -376,10 +403,11 @@ def _run_heartbeat_turn() -> tuple[str, str] | None:
     )
     body = instruction + checklist
     try:
-        messages = load_session()
-        messages.append(HumanMessage(content=body))
-        result, last_ai_text = invoke_orchestrator(messages)
-        save_session(result.get("messages", []))
+        full_messages = load_session()
+        to_send = trim_messages_to_window(full_messages)
+        to_send.append(HumanMessage(content=body))
+        result, last_ai_text = invoke_orchestrator(to_send)
+        save_session(full_messages + [HumanMessage(content=body)] + [AIMessage(content=last_ai_text or "")])
         route = result.get("route", "?")
         log.info("Heartbeat turn completed, route=%s", route)
         return (last_ai_text or "", route)
@@ -407,7 +435,7 @@ async def _heartbeat_loop() -> None:
             last_ai_text, _route = result
             last_ai_text = (last_ai_text or "").strip()
             if not _is_heartbeat_ok(last_ai_text):
-                chat_id = _get_gmail_push_chat_id()
+                chat_id = _get_telegram_summary_chat_id()
                 if chat_id:
                     try:
                         formatted = format_orchestrator_reply_for_telegram(last_ai_text)
@@ -429,123 +457,16 @@ async def _heartbeat_loop() -> None:
                 asyncio.create_task(_run_scheduled_task_async(entry))
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    _check_anthropic_key()
-    _register_telegram_webhook()
-    if HEARTBEAT_INTERVAL_SEC > 0:
-        asyncio.create_task(_heartbeat_loop())
-        log.info("Heartbeat enabled every %s seconds", HEARTBEAT_INTERVAL_SEC)
-
-
-def on_gmail_push(payload: dict) -> None:
-    """
-    Trigger the orchestrator (which routes to Gmail agent or others): summarize the new email and suggest actions.
-    Flow: Gmail Pub/Sub webhook → Orchestrator → Gmail Agent (or other agents if needed).
-    payload: decoded Gmail notification {"emailAddress": "...", "historyId": "..."}
-    """
-    from langchain_core.messages import HumanMessage
-
-    from src.orchestrator_runner import invoke_orchestrator
-
-    prompt = (
-        "A new email just arrived. Get the most recent email from my inbox, "
-        "summarize it clearly, and suggest specific actions I can take "
-        "(e.g. reply, archive, add to calendar, follow up later)."
-    )
-    try:
-        result, last_ai_text = invoke_orchestrator([HumanMessage(content=prompt)])
-        log.info("Orchestrator route on Gmail push: %s", result.get("route", "?"))
-        if last_ai_text:
-            log.info("Orchestrator reply: %s", last_ai_text)
-            chat_id = _get_gmail_push_chat_id()
-            if chat_id:
-                try:
-                    formatted = format_orchestrator_reply_for_telegram(last_ai_text.strip())
-                    _send_telegram_text(chat_id, formatted, already_formatted_for_telegram=True)
-                    log.info("Gmail summary sent to Telegram chat_id=%s", chat_id)
-                except Exception as send_err:
-                    try:
-                        _send_telegram_text(chat_id, last_ai_text.strip())
-                    except Exception:
-                        pass
-                    log.exception("Failed to send Gmail summary to Telegram: %s", send_err)
-            else:
-                log.debug("No TELEGRAM_CHAT_ID or stored chat_id; Gmail summary not sent to Telegram")
-    except Exception as e:
-        log.exception("Orchestrator failed on Gmail push: %s", e)
-
-
-def _decode_gmail_notification(data: str) -> dict | None:
-    """Decode Pub/Sub message.data (base64url) to Gmail notification dict."""
-    if not data:
-        return None
-    try:
-        # base64url may omit padding
-        pad = 4 - len(data) % 4
-        if pad != 4:
-            data += "=" * pad
-        raw = base64.urlsafe_b64decode(data)
-        return json.loads(raw)
-    except Exception as e:
-        log.warning("Failed to decode notification data: %s", e)
-        return None
-
-
-@app.post("/webhook/gmail")
-async def gmail_webhook(request: Request, background_tasks: BackgroundTasks):
-    """
-    Receive Gmail Pub/Sub push notifications.
-    Body: { "message": { "data": "<base64url>", "messageId": "...", ... }, "subscription": "..." }
-    Decoded data: { "emailAddress": "...", "historyId": "..." }
-    """
-    try:
-        body = await request.json()
-    except Exception as e:
-        log.warning("Invalid JSON body: %s", e)
-        return JSONResponse(status_code=400, content={"error": "invalid json"})
-
-    message = body.get("message") or {}
-    raw_data = message.get("data")
-    subscription = body.get("subscription", "")
-    message_id = message.get("messageId") or message.get("message_id")
-
-    payload = _decode_gmail_notification(raw_data) if raw_data else None
-    if payload:
-        log.info(
-            "Gmail push: email=%s historyId=%s subscription=%s messageId=%s",
-            payload.get("emailAddress"),
-            payload.get("historyId"),
-            subscription,
-            message_id,
-        )
-    else:
-        log.info(
-            "Gmail push (raw): subscription=%s messageId=%s data_len=%s",
-            subscription,
-            message_id,
-            len(raw_data) if raw_data else 0,
-        )
-
-    if payload:
-        background_tasks.add_task(on_gmail_push, payload)
-
-    # 200 = acknowledge so Pub/Sub does not retry
-    return JSONResponse(
-        status_code=200,
-        content={"ok": True, "emailAddress": (payload or {}).get("emailAddress"), "historyId": (payload or {}).get("historyId")},
-    )
-
-
-def process_telegram_message(chat_id: int, text: str) -> None:
+def process_telegram_message(chat_id: int, content: str | list) -> None:
     """
     Load global session, append user message, invoke orchestrator, save session, send reply to Telegram.
+    content: plain text (str) or multimodal list of blocks (e.g. text + image_url for photos).
     Used by both webhook and polling. Sends a short error message to the user on failure.
     Shows typing indicator while processing (repeated every 4s until reply is sent).
     """
     import threading
 
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import AIMessage, HumanMessage
 
     from src.orchestrator_runner import invoke_orchestrator
 
@@ -562,10 +483,11 @@ def process_telegram_message(chat_id: int, text: str) -> None:
         typing_thread.start()
 
         try:
-            messages = load_session()
-            messages.append(HumanMessage(content=text))
-            result, last_ai_text = invoke_orchestrator(messages)
-            save_session(result.get("messages", []))
+            full_messages = load_session()
+            to_send = trim_messages_to_window(full_messages)
+            to_send.append(HumanMessage(content=content))
+            result, last_ai_text = invoke_orchestrator(to_send)
+            save_session(full_messages + [HumanMessage(content=content)] + [AIMessage(content=last_ai_text or "")])
 
             reply = (last_ai_text or "No reply generated.").strip()
             try:
@@ -588,14 +510,48 @@ def process_telegram_message(chat_id: int, text: str) -> None:
 
 def _on_telegram_update(update_dict: dict) -> None:
     """
-    Process one Telegram update: parse chat_id and text, then process_telegram_message.
-    Runs in a background task. Saves chat_id so Gmail push summaries can be sent to this chat.
+    Process one Telegram update: parse chat_id and text or photo, then process_telegram_message.
+    Runs in a background task. Saves chat_id so heartbeat/report summaries can be sent to this chat.
+    Supports text messages and photo messages (with optional caption). Photo + caption sent as multimodal.
     """
     message = (update_dict or {}).get("message") or {}
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
+    if chat_id is None:
+        return
+
     text = (message.get("text") or "").strip()
-    if not text or chat_id is None:
+    photos = message.get("photo") or []
+
+    # Photo (with or without caption): download and send as multimodal content
+    if photos:
+        file_id = photos[-1].get("file_id")  # largest size
+        if not file_id:
+            return
+        caption = (message.get("caption") or "").strip() or text
+        photo_bytes = _download_telegram_photo(file_id)
+        if not photo_bytes:
+            _set_last_telegram_chat_id(chat_id)
+            _send_telegram_text(chat_id, "Couldn't download the photo, please try again.")
+            return
+        # Infer media type from common Telegram formats; default to jpeg
+        media_type = "image/jpeg"
+        content_blocks = []
+        if caption:
+            content_blocks.append({"type": "text", "text": caption})
+        else:
+            content_blocks.append({"type": "text", "text": "User sent an image."})
+        b64 = base64.b64encode(photo_bytes).decode("ascii")
+        content_blocks.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{b64}"},
+        })
+        _set_last_telegram_chat_id(chat_id)
+        process_telegram_message(chat_id, content_blocks)
+        return
+
+    # Text only
+    if not text:
         return
     _set_last_telegram_chat_id(chat_id)
     process_telegram_message(chat_id, text)

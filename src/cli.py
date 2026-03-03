@@ -22,7 +22,7 @@ from rich.logging import RichHandler
 from rich.markdown import Markdown
 
 from src.agents.gmail.auth import get_credentials
-from src.session import load_session, save_session
+from src.session import load_session, save_session, trim_messages_to_window
 
 logging.basicConfig(
     level=logging.INFO,
@@ -185,13 +185,12 @@ def check_env() -> None:
 
 
 def _run_chat_interactive() -> None:
-    """Load session, run interactive chat loop (read input, invoke, save, print)."""
-    from langchain_core.messages import HumanMessage
+    """Load session, run interactive chat loop (read input, invoke, save, print). Uses sliding window for API calls."""
+    from langchain_core.messages import AIMessage, HumanMessage
 
-    from src.graph.orchestrator import build_orchestrator
+    from src.orchestrator_runner import invoke_orchestrator
 
     messages = load_session()
-    orchestrator = build_orchestrator()
     console.print("[bold green]Doot[/] interactive mode. Type [bold]quit[/] or [bold]exit[/] to leave.\n")
     while True:
         try:
@@ -202,25 +201,30 @@ def _run_chat_interactive() -> None:
         if not user_input or user_input.lower() in ("quit", "exit"):
             console.print("Bye!")
             break
-        messages = messages + [HumanMessage(content=user_input)]
-        result_messages = _invoke_and_print(orchestrator, messages)
-        save_session(result_messages)
-        messages = result_messages
+        to_send = trim_messages_to_window(messages) + [HumanMessage(content=user_input)]
+        result, last_ai_text = invoke_orchestrator(to_send)
+        log.info("Route chosen: %s", result.get("route", "?"))
+        console.print()
+        console.print(Markdown(last_ai_text or ""))
+        console.print()
+        messages = messages + [HumanMessage(content=user_input)] + [AIMessage(content=last_ai_text or "")]
+        save_session(messages)
 
 
 @app.command()
 def chat(message: str | None = typer.Argument(None, help="One-shot message. Omit for interactive mode.")) -> None:
     """Talk to the Doot orchestrator (routes to Gmail agent, etc). Session is loaded/saved to file."""
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import AIMessage, HumanMessage
 
-    from src.graph.orchestrator import build_orchestrator
-
-    orchestrator = build_orchestrator()
+    from src.orchestrator_runner import invoke_orchestrator
 
     if message:
         messages = load_session()
-        result_messages = _run_once(orchestrator, message, messages)
-        save_session(result_messages)
+        to_send = trim_messages_to_window(messages) + [HumanMessage(content=message)]
+        result, last_ai_text = invoke_orchestrator(to_send)
+        log.info("Route chosen: %s", result.get("route", "?"))
+        _print_last_ai(result["messages"])
+        save_session(messages + [HumanMessage(content=message)] + [AIMessage(content=last_ai_text or "")])
         return
 
     _run_chat_interactive()
@@ -262,7 +266,7 @@ def _run_once(orchestrator, message: str, initial_messages=None):
 
 @app.command()
 def webhook() -> None:
-    """Run the webhook server (Gmail Pub/Sub push). Alias for 'start'. Point subscription to {WEBHOOK_URL}/webhook/gmail."""
+    """Run the webhook server (Telegram + heartbeat). Alias for 'start'."""
     _run_webhook()
 
 
