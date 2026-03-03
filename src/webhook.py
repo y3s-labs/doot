@@ -283,9 +283,11 @@ def _send_telegram_typing(chat_id: int) -> None:
         log.debug("Telegram typing action failed: %s", e)
 
 
-def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegram: bool = False) -> None:
+async def _send_telegram_text_async(
+    chat_id: int, text: str, *, already_formatted_for_telegram: bool = False
+) -> None:
     """
-    Send a text message to a Telegram chat.
+    Send a text message to a Telegram chat (async). Use from async code (e.g. heartbeat loop).
     If already_formatted_for_telegram is True, text is Telegram HTML and is sent with parse_mode=HTML.
     Otherwise text is treated as plain (no HTML). Truncates to TELEGRAM_MAX_MESSAGE_LENGTH.
     """
@@ -295,15 +297,21 @@ def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegr
         return
     if len(text) > TELEGRAM_MAX_MESSAGE_LENGTH:
         text = text[: TELEGRAM_MAX_MESSAGE_LENGTH - 3] + "..."
-    async def _send() -> None:
-        from telegram import Bot
-        from telegram.constants import ParseMode
-        bot = Bot(token=token)
-        kwargs = {"chat_id": chat_id, "text": text}
-        if already_formatted_for_telegram:
-            kwargs["parse_mode"] = ParseMode.HTML
-        await bot.send_message(**kwargs)
-    asyncio.run(_send())
+    from telegram import Bot
+    from telegram.constants import ParseMode
+    bot = Bot(token=token)
+    kwargs = {"chat_id": chat_id, "text": text}
+    if already_formatted_for_telegram:
+        kwargs["parse_mode"] = ParseMode.HTML
+    await bot.send_message(**kwargs)
+
+
+def _send_telegram_text(chat_id: int, text: str, *, already_formatted_for_telegram: bool = False) -> None:
+    """
+    Send a text message to a Telegram chat (sync). Use from sync code only.
+    From async code (e.g. _heartbeat_loop), use await _send_telegram_text_async() instead.
+    """
+    asyncio.run(_send_telegram_text_async(chat_id, text, already_formatted_for_telegram=already_formatted_for_telegram))
 
 app = FastAPI(title="Doot webhook", version="0.1.0")
 
@@ -403,12 +411,12 @@ async def _heartbeat_loop() -> None:
                 if chat_id:
                     try:
                         formatted = format_orchestrator_reply_for_telegram(last_ai_text)
-                        _send_telegram_text(chat_id, formatted, already_formatted_for_telegram=True)
+                        await _send_telegram_text_async(chat_id, formatted, already_formatted_for_telegram=True)
                         log.info("Heartbeat reported something, sent to Telegram chat_id=%s", chat_id)
                     except Exception as e:
                         log.warning("Heartbeat Telegram send failed: %s", e)
                         try:
-                            _send_telegram_text(chat_id, last_ai_text)
+                            await _send_telegram_text_async(chat_id, last_ai_text)
                         except Exception:
                             pass
             else:
