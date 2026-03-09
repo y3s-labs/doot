@@ -5,7 +5,7 @@ from __future__ import annotations
 from googleapiclient.errors import HttpError
 from langchain_core.tools import tool
 
-from src.agents.gmail.client import get_message, list_messages, message_to_summary, trash_message
+from src.agents.gmail.client import get_message, list_messages, message_to_summary, send_message, trash_message
 
 # Message shown when Gmail returns 404 (message deleted, trashed, or ID from old conversation)
 _MSG_NOT_FOUND = (
@@ -93,6 +93,20 @@ def gmail_get_email(message_id: str) -> str:
 
 
 @tool
+def gmail_send_email(to_email: str, subject: str, body: str) -> str:
+    """Send a new email. to_email: recipient address. subject: subject line. body: plain-text body.
+    Use when the user asks to send, reply (with new content), or email someone."""
+    to_email = to_email.strip()
+    if not to_email or "@" not in to_email:
+        return "Invalid to_email: must be a valid email address."
+    try:
+        send_message(to_email=to_email, subject=subject.strip(), body=body.strip())
+        return f"Email sent to {to_email} with subject: {subject[:50]}{'...' if len(subject) > 50 else ''}"
+    except Exception as e:
+        return f"Failed to send email: {e}"
+
+
+@tool
 def gmail_trash_email(message_id: str) -> str:
     """Move an email to Trash (delete from inbox). The message_id must be the 'id' from gmail_list_inbox or gmail_search (e.g. '18b2f3a1c4d5e6f7').
     Use this when the user asks to delete, remove, or trash an email. Do not use an email address—only the id from list/search results."""
@@ -127,4 +141,4 @@ def _extract_text(payload: dict) -> str:
     return ""
 
 
-ALL_TOOLS = [gmail_list_inbox, gmail_search, gmail_get_email, gmail_trash_email]
+ALL_TOOLS = [gmail_list_inbox, gmail_search, gmail_get_email, gmail_send_email, gmail_trash_email]

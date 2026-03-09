@@ -390,7 +390,7 @@ def _run_heartbeat_turn() -> tuple[str, str] | None:
     invoke orchestrator, save session. Returns (last_ai_text, route) or None on failure.
     Called from async loop via asyncio.to_thread so it does not block the event loop.
     """
-    from langchain_core.messages import HumanMessage
+    from langchain_core.messages import AIMessage, HumanMessage
 
     from src.orchestrator_runner import invoke_orchestrator
 
