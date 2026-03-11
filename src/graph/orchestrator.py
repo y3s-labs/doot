@@ -15,6 +15,7 @@ from langchain_core.tools import tool
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import create_react_agent
 
+from src.agents.browser.agent import create_browser_agent
 from src.agents.calendar.agent import create_calendar_agent
 from src.agents.gmail.agent import create_gmail_agent
 from src.agents.websearch.agent import create_websearch_agent
@@ -172,6 +173,15 @@ def calendar(instruction: str) -> str:
 
 
 @tool
+def browser(instruction: str) -> str:
+    """Use the browser: open a URL, read the page, click links/buttons, fill forms, scroll. Pass a clear instruction (e.g. 'go to example.com and tell me the headline' or 'search for X on duckduckgo.com')."""
+    agent = create_browser_agent()
+    messages = _agent_messages(instruction)
+    result = agent.invoke({"messages": messages})
+    return _extract_last_ai_text(result.get("messages", []))
+
+
+@tool
 def direct(instruction: str) -> str:
     """Answer using memory (MEMORY.md and daily logs). Use for facts the user has stored, or to read/append memory. Pass a short instruction or question."""
     agent = _build_direct_agent()
@@ -180,7 +190,7 @@ def direct(instruction: str) -> str:
     return _extract_last_ai_text(result.get("messages", []))
 
 
-ORCHESTRATOR_AGENT_TOOLS = [websearch, gmail, calendar, direct]
+ORCHESTRATOR_AGENT_TOOLS = [websearch, gmail, calendar, browser, direct]
 
 REACT_SYSTEM = SystemMessage(
     content="""You are a capable personal assistant that completes tasks by reasoning step-by-step and using tools strategically.
@@ -189,6 +199,7 @@ REACT_SYSTEM = SystemMessage(
 - **websearch(query)** — Search the web for current information, news, weather, facts, etc.
 - **gmail(instruction)** — Read, search, send, or manage emails. Be specific: "search for emails from John about the Q3 report"
 - **calendar(instruction)** — Read, create, or manage calendar events. Be specific: "list events for next week" or "create a meeting with Sarah on Friday at 2pm"
+- **browser(instruction)** — Control a browser: open a URL, read the page, click links, fill forms. Use for: "go to example.com and summarize" or "search for X on site Y"
 - **direct(instruction)** — Send a direct message or notification to the user outside this chat
 
 ## How to Work
@@ -200,6 +211,7 @@ REACT_SYSTEM = SystemMessage(
 
 ## Guidelines
 - For research tasks: run separate focused searches rather than one vague query (e.g. "Portland weather today" + "Portland crime news this week" separately)
+- For browser tasks: use browser(instruction) when the user wants to open a site, read its content, or interact with a specific webpage (click, search, fill forms).
 - For email/calendar tasks: confirm actions before executing irreversible ones (sending email, deleting events)
 - If a tool returns insufficient results, rephrase and retry with a different query
 - Always prefer being accurate over being fast — take the steps needed to get it right
